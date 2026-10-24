@@ -1,0 +1,26 @@
+{
+  "name": "chatgpt-sidebar-tools",
+  "version": "2.1.3",
+  "private": true,
+  "license": "MIT",
+  "author": "ahang39",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ahang39/chatgpt-sidebar-tools.git"
+  },
+  "homepage": "https://github.com/ahang39/chatgpt-sidebar-tools#readme",
+  "bugs": "https://github.com/ahang39/chatgpt-sidebar-tools/issues",
+  "engines": {
+    "node": ">=22"
+  },
+  "description": "Passive ChatGPT timestamps and groups with no script-initiated network requests",
+  "scripts": {
+    "check": "node --check chatgpt-sidebar-tools.user.js",
+    "test": "node --test tests/core.test.cjs",
+    "test:browser": "node --test tests/browser.test.cjs",
+    "test:all": "npm run check && npm test && npm run test:browser"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
