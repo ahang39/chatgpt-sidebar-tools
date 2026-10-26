@@ -104,6 +104,66 @@ async function feedChat(page, text, { key = 'chat', close = false, splitBytes = 
   }, { text, key, close, splitBytes });
 }
 
+test('right-click opens each sidebar conversation native menu without navigation or added requests', async () => {
+  const { page, state, errors } = await setup({ nativeRequest: false });
+  try {
+    await page.evaluate(() => {
+      for (const row of document.querySelectorAll('[data-sidebar-cycle-item]')) {
+        const button = row.querySelector('button');
+        if (!button) continue;
+        button.setAttribute('aria-haspopup', 'menu'); button.setAttribute('aria-expanded', 'false');
+        const open = event => {
+          if (event.type === 'pointerdown' && event.button !== 0) return;
+          button.setAttribute('aria-expanded', 'true');
+          document.body.dataset.menuFor = row.querySelector('a').getAttribute('href');
+          document.body.dataset.opens = String(Number(document.body.dataset.opens || 0) + 1);
+        };
+        button.onclick = row.querySelector('a').getAttribute('href') === '/c/pinned' ? open : null;
+        if (!button.onclick) button.addEventListener('pointerdown', open);
+      }
+    });
+    await page.locator('#native-a .native-title').click({ button: 'right' });
+    assert.equal(await page.locator('body').getAttribute('data-menu-for'), '/c/a');
+    assert.equal(await page.locator('body').getAttribute('data-opens'), '1');
+    await page.locator('#native-a a').click({ button: 'right' });
+    assert.equal(await page.locator('body').getAttribute('data-opens'), '1', 'an open menu must not toggle closed');
+    await page.locator('a[href="/c/pinned"] .native-title').click({ button: 'right' });
+    assert.equal(await page.locator('body').getAttribute('data-menu-for'), '/c/pinned');
+    assert.equal(await page.locator('body').getAttribute('data-opens'), '2');
+    assert.equal(page.url(), 'https://chatgpt.com/');
+    assert.equal(await page.evaluate(() => window.hostFetchCalls), 0);
+    assert.deepEqual(state.requests, []);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('right-click elsewhere, editable rows and unavailable menu buttons keep browser defaults', async () => {
+  const { page, state } = await setup();
+  try {
+    const results = await page.evaluate(() => {
+      const button = document.querySelector('#native-menu');
+      button.setAttribute('aria-haspopup', 'menu');
+      const input = document.createElement('input'); document.querySelector('#native-a a').append(input);
+      const outside = document.createElement('div'); outside.className = 'sidebar-item';
+      outside.innerHTML = '<a href="/c/body-chat">正文链接</a><button aria-haspopup="menu">菜单</button>';
+      document.querySelector('main').append(outside);
+      const menu = document.createElement('div'); menu.setAttribute('role', 'menu'); document.body.append(menu);
+      const dispatch = target => target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }));
+      const untouched = ['#composer', 'main h1', '#new-chat', '.cst-group-toggle', 'nav section:nth-of-type(2)', '#native-week a'].map(selector => dispatch(document.querySelector(selector)));
+      untouched.push(dispatch(input), dispatch(outside.querySelector('a')), dispatch(menu));
+      button.disabled = true; untouched.push(dispatch(document.querySelector('#native-a a')));
+      button.disabled = false; button.setAttribute('aria-disabled', 'true'); untouched.push(dispatch(document.querySelector('#native-a a')));
+      button.removeAttribute('aria-disabled');
+      const prevented = new MouseEvent('contextmenu', { bubbles: true, cancelable: true }); prevented.preventDefault();
+      document.querySelector('#native-a a').dispatchEvent(prevented);
+      return { untouched, menuOpened: document.body.dataset.nativeMenu };
+    });
+    assert.ok(results.untouched.every(Boolean), 'unrelated context menus must not be cancelled');
+    assert.equal(results.menuOpened, undefined);
+    assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
 test('an ongoing native chat stream updates the old row immediately without another list request', async () => {
   const { page, state, errors } = await setup();
   try {

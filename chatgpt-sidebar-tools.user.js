@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 原生侧边栏助手
 // @namespace    local.chatgpt.sidebar-tools
-// @version      2.1.3
-// @description  仅显示原生对话的相对时间与可折叠分组；不主动发起任何网络请求。
+// @version      2.2.0
+// @description  原生对话相对时间、可折叠分组与右键菜单快捷操作；不主动发起任何网络请求。
 // @author       ahang39
 // @homepageURL  https://github.com/ahang39/chatgpt-sidebar-tools
 // @supportURL   https://github.com/ahang39/chatgpt-sidebar-tools/issues
@@ -369,6 +369,24 @@
     if (relevant) schedule();
   });
   function observe() { observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['href', 'aria-label', 'aria-expanded', 'datetime'] }); }
+  function openRowMenu(event) {
+    if (event.defaultPrevented || !(event.target instanceof Element)) return;
+    const target = event.target;
+    if (target.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"]),[role="menu"],[role="menuitem"]')) return;
+    const row = target.closest('[data-sidebar-cycle-item],.sidebar-item,[data-testid^="history-item-"]');
+    if (!row?.closest('nav,aside,#history')) return;
+    const link = row.matches('a[href*="/c/"]') ? row : row.querySelector('a[href*="/c/"]');
+    if (!link || !conversationId(link.getAttribute('href'))) return;
+    const button = row.querySelector('button[aria-haspopup="menu"]');
+    if (!button || button.matches(':disabled,[aria-disabled="true"]')) return;
+    event.preventDefault(); event.stopPropagation();
+    if (button.getAttribute('aria-expanded') === 'true') return;
+    button.focus({ preventScroll: true });
+    // Radix triggers open on primary pointerdown; click-only native triggers need click.
+    button.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, buttons: 1, pointerType: 'mouse', isPrimary: true }));
+    button.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, button: 0, buttons: 0, pointerType: 'mouse', isPrimary: true }));
+    if (button.getAttribute('aria-expanded') !== 'true') button.click();
+  }
   function start() {
     const style = owned('style', 'style');
     style.textContent = [
@@ -392,6 +410,7 @@
     ].join('\n');
     (document.head || document.documentElement).append(style);
     observe(); schedule();
+    document.addEventListener('contextmenu', openRowMenu);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) schedule(); });
     // Local clock display only. No network work is scheduled here or anywhere in this script.
     setInterval(() => { if (!document.hidden) schedule(); }, 30000);

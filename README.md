@@ -1,6 +1,6 @@
 # ChatGPT Sidebar Tools
 
-为 ChatGPT 原生侧边栏补充相对时间与可折叠日期分组的 Tampermonkey 脚本。
+为 ChatGPT 原生侧边栏补充相对时间、可折叠日期分组与右键菜单快捷操作的 Tampermonkey 脚本。
 
 A small userscript that adds relative timestamps and collapsible date groups to ChatGPT's native sidebar. It observes existing responses and makes **no additional network requests**. The current UI uses Chinese labels.
 
@@ -11,10 +11,11 @@ A small userscript that adds relative timestamps and collapsible date groups to 
 - 标题在左、时间在右，显示“刚刚”“8分钟前”“2小时前”等相对时间；悬停查看完整时间。
 - 最近对话按“今天 / 昨天 / 最近一周 / 更多”分组，空分组隐藏，每组独立记住折叠状态。
 - 置顶对话也显示时间，保留原生置顶顺序。
+- 右键点击侧边栏的对话行，打开该行原生菜单；其他区域及输入控件的右键行为不变。菜单仍锚定在原生按钮旁。
 - 收到网页原生聊天响应时更新对应对话时间，不需要额外刷新列表。
 - 保留原生链接、标题、菜单及项目区域。按会话 ID 关联数据，标题更新或重名不会串时间。
 
-仅保留时间与分组，不提供批量归档、删除、主动刷新或加载全部功能。
+提供时间、分组与原生菜单快捷操作，不提供批量归档、删除、主动刷新或加载全部功能。
 
 ## 安装
 
