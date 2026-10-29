@@ -423,6 +423,8 @@ test('rename and native node recycling cannot attach another conversation timest
     await page.evaluate(() => { document.querySelector('#native-a a').href = '/c/recycled'; });
     await settle(page);
     assert.equal(await page.locator('#native-a .cst-time').count(), 0);
+    assert.equal(await page.locator('#native-a a').evaluate(n => n.style.getPropertyValue('--cst-recency-color')), '');
+    assert.equal(await page.locator('#native-a a').evaluate(n => n.style.getPropertyValue('--cst-recency-weight')), '');
     const updated = new Date(Date.now() - 7200000).toISOString();
     state.items = [{ id: 'recycled', title: '另一个对话', update_time: updated }, ...state.items];
     await nativeList(page);
@@ -493,6 +495,61 @@ test('an empty native sidebar has no empty headers, notices, buttons or active r
     await nativeList(page); await settle(page, true);
     await page.clock.fastForward(3600000); await settle(page, true);
     assert.equal(await page.locator('.cst-group, .cst-time, .cst-tools, .cst-status').count(), 0);
+    assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
+test('only time labels use recency color and weight; titles retain native styling', async () => {
+  const now = Date.now(), ids = ['a', 'b', 'week', 'old', 'pinned'];
+  const ages = [8 / 60, 3, 12, 48, 1];
+  const items = ids.map((id, i) => ({ id, title: '示例对话', update_time: new Date(now - ages[i] * 3600000).toISOString() }));
+  const { page, state } = await setup({ items, clock: true });
+  try {
+    await page.evaluate(() => {
+      ['最新的讨论', '稍早的方案', '上午的记录', '两天前的记录'].forEach((title, i) => {
+        document.querySelectorAll('#native-list .native-title')[i].textContent = title;
+      });
+    });
+    const read = () => page.evaluate(() => {
+      const context = document.createElement('canvas').getContext('2d');
+      const luminance = color => {
+        context.fillStyle = color; context.fillRect(0, 0, 1, 1);
+        const rgb = [...context.getImageData(0, 0, 1, 1).data].slice(0, 3).map(v => {
+          v /= 255; return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+        });
+        return rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+      };
+      const bg = luminance(getComputedStyle(document.querySelector('aside')).backgroundColor);
+      return ['a', 'b', 'week', 'old'].map(id => {
+        const link = document.querySelector(`a[href="/c/${id}"]`), title = link.querySelector('.native-title'), time = link.querySelector('time');
+        const color = getComputedStyle(time).color, light = luminance(color);
+        return { light, weight: getComputedStyle(time).fontWeight, titleColor: getComputedStyle(title).color, titleWeight: getComputedStyle(title).fontWeight, red: context.getImageData(0, 0, 1, 1).data[0], contrast: (Math.max(bg, light) + 0.05) / (Math.min(bg, light) + 0.05) };
+      });
+    });
+    for (const dark of [false, true]) {
+      await page.evaluate(dark => {
+        document.documentElement.classList.toggle('dark', dark);
+        for (const property of ['--text-primary', '--text-secondary']) document.documentElement.style.setProperty(property, dark ? '#b4b4bd' : '#333333');
+      }, dark);
+      const colors = await read();
+      assert.ok(colors.every(c => c.contrast >= 4.5));
+      assert.deepEqual(colors.map(c => c.weight), ['600', '500', '400', '400']);
+      assert.deepEqual(colors.map(c => c.titleWeight), ['400', '400', '400', '400']);
+      assert.equal(new Set(colors.map(c => c.titleColor)).size, 1);
+      for (let i = 1; i < colors.length; i++) {
+        assert.ok(dark ? colors[i - 1].light > colors[i].light : colors[i - 1].light < colors[i].light);
+        assert.ok(Math.abs(colors[i - 1].red - colors[i].red) >= 12, 'minutes, hours and days need visible color separation even when native theme colors are identical');
+      }
+      if (process.env.SCREENSHOT_DIR) {
+        fs.mkdirSync(process.env.SCREENSHOT_DIR, { recursive: true });
+        await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, `recency-${dark ? 'dark' : 'light'}.png`) });
+        await page.locator('#native-list').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, `recency-tiers-${dark ? 'dark' : 'light'}.png`) });
+      }
+    }
+    const before = (await read())[0].light;
+    await page.clock.fastForward(3 * 3600000); await settle(page, true);
+    assert.ok((await read())[0].light < before);
+    assert.equal((await read())[0].weight, '500');
     assertNativeOnly(state, 1);
   } finally { await page.close(); }
 });

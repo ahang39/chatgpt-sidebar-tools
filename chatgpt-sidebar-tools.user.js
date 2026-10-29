@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 原生侧边栏助手
 // @namespace    local.chatgpt.sidebar-tools
-// @version      2.2.0
+// @version      2.3.3
 // @description  原生对话相对时间、可折叠分组与右键菜单快捷操作；不主动发起任何网络请求。
 // @author       ahang39
 // @homepageURL  https://github.com/ahang39/chatgpt-sidebar-tools
@@ -275,6 +275,8 @@
     for (const node of document.querySelectorAll('[data-cst-list], [data-cst-link], [data-cst-shell], [data-cst-row], [data-cst-collapsed], [data-cst-sidebar]')) {
       for (const name of ['data-cst-list', 'data-cst-link', 'data-cst-shell', 'data-cst-row', 'data-cst-collapsed', 'data-cst-sidebar']) node.removeAttribute(name);
       node.style.removeProperty('--cst-order');
+      node.style.removeProperty('--cst-recency-color');
+      node.style.removeProperty('--cst-recency-weight');
     }
   }
   function dateFor(row) {
@@ -284,7 +286,14 @@
   function decorate(row, ms) {
     attr(row.wrapper, 'data-cst-row', row.id); attr(row.shell, 'data-cst-shell', ''); attr(row.link, 'data-cst-link', '');
     let time = row.link.querySelector(':scope > [data-cst-owned="time"]');
-    if (!ms) { time?.remove(); return; }
+    if (!ms) {
+      row.link.style.removeProperty('--cst-recency-color'); row.link.style.removeProperty('--cst-recency-weight');
+      time?.remove(); return;
+    }
+    const hours = Math.max(0, (Date.now() - ms) / 3600000);
+    const tone = hours < 1 ? 0 : hours < 6 ? 1 : hours < 24 ? 2 : 3;
+    row.link.style.setProperty('--cst-recency-color', `var(--cst-tone-${tone})`);
+    row.link.style.setProperty('--cst-recency-weight', tone === 0 ? '600' : tone === 1 ? '500' : '400');
     if (!time) { time = owned('time', 'time'); time.className = 'cst-time'; row.link.append(time); }
     setText(time, relativeTime(ms));
     attr(time, 'datetime', new Date(ms).toISOString());
@@ -390,16 +399,17 @@
   function start() {
     const style = owned('style', 'style');
     style.textContent = [
-      '[data-cst-sidebar]{--cst-muted:var(--text-secondary,#62636b)}',
-      ':is(.dark,[data-theme="dark"]) [data-cst-sidebar]{--cst-muted:var(--text-secondary,#b4b4bd)}',
+      '[data-cst-sidebar]{--cst-tone-0:#15161a;--cst-tone-1:#3f4552;--cst-tone-2:#5b6372;--cst-tone-3:#6e7079;--cst-muted:var(--text-secondary,#62636b)}',
+      ':is(.dark,[data-theme="dark"]) [data-cst-sidebar]{--cst-tone-0:#f5f5fa;--cst-tone-1:#d2d6e1;--cst-tone-2:#b1b7c5;--cst-tone-3:#9699a4;--cst-muted:var(--text-secondary,#b4b4bd)}',
       '[data-cst-list]{display:flex!important;flex-direction:column!important}',
       '[data-cst-list]>*{order:var(--cst-order,5000000)}',
       '[data-cst-list]>[data-cst-collapsed="true"],[data-cst-list]>[data-cst-owned="group"][hidden]{display:none!important}',
       '[data-cst-shell]{position:relative}',
       '[data-cst-shell],[data-cst-sidebar] :is([data-sidebar-cycle-item],.sidebar-item):is([href*="/c/"],:has(a[href*="/c/"])){min-height:32px!important;height:32px!important}',
       '[data-cst-link]{display:flex!important;flex:1 1 0%!important;flex-direction:row!important;align-items:center!important;align-self:stretch;gap:10px;min-width:0!important;overflow:hidden}',
+      '[data-cst-shell]:is(:hover,:focus-within,[aria-current="page"]) [data-cst-link]>.cst-time,[data-cst-link][aria-current="page"]>.cst-time{color:var(--cst-tone-0)!important}',
       '[data-cst-link]>:not(.cst-time){order:0!important;flex:1 1 0%!important;min-width:0!important;overflow:hidden!important;text-overflow:ellipsis;white-space:nowrap}',
-      '[data-cst-link]>.cst-time{order:1!important;flex:0 0 auto!important;margin-inline-start:auto;text-align:end;color:var(--cst-muted);font-size:11px;font-weight:400;line-height:20px;font-variant-numeric:tabular-nums;white-space:nowrap}',
+      '[data-cst-link]>.cst-time{order:1!important;flex:0 0 auto!important;margin-inline-start:auto;text-align:end;color:var(--cst-recency-color,var(--cst-muted));font-size:11px;font-weight:var(--cst-recency-weight,400);line-height:20px;font-variant-numeric:tabular-nums;white-space:nowrap}',
       '.cst-group{display:flex;align-items:center;gap:7px;min-height:28px;margin-top:6px;padding:0 9px;color:var(--cst-muted);font:inherit;font-size:12px}',
       '.cst-group-toggle{display:flex;align-items:center;gap:6px;flex:1;min-width:0;min-height:28px;padding:4px 0;border:0;background:transparent;color:inherit;font:inherit;font-weight:500;text-align:start;cursor:pointer}',
       '.cst-group-toggle svg{width:12px;height:12px;flex:none}',
