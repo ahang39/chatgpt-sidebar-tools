@@ -1,6 +1,16 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { timestamp, normalize, groupFor, sorted, conversationId, relativeTime, sseParser, pinItems } = require('../chatgpt-sidebar-tools.user.js');
+const { timestamp, normalize, groupFor, sorted, conversationId, relativeTime, sseParser, pinItems, collectionData } = require('../chatgpt-sidebar-tools.user.js');
+
+test('collections validate persisted metadata and reject corruption without guessing repairs', () => {
+  const data = collectionData(null);
+  assert.equal(data.groups[0].name, '稍后再看');
+  assert.equal(collectionData(JSON.stringify({ version: 1, groups: [], items: [] })).collapsed, false);
+  assert.equal(collectionData(JSON.stringify({ version: 1, collapsed: true, groups: [], items: [] })).collapsed, true);
+  data.items.push({ id: 'a', title: '<img src=x onerror=alert(1)>', groups: ['later'] });
+  assert.deepEqual(collectionData(JSON.stringify(data)), data);
+  for (const raw of ['{', '{}', JSON.stringify({ ...data, version: 2 }), JSON.stringify({ ...data, items: [{ id: 'a/b', title: '', groups: ['later'] }] }), JSON.stringify({ ...data, items: [{ id: 'a', title: '', groups: ['missing'] }] }), JSON.stringify({ ...data, groups: [...data.groups, data.groups[0]] })]) assert.throws(() => collectionData(raw));
+});
 
 test('timestamps support seconds, milliseconds and ISO; unknown dates remain unknown', () => {
   const ms = Date.parse('2026-10-22T01:00:00Z');

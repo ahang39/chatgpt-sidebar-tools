@@ -49,8 +49,8 @@ async function nativeList(page, { offset = 0, account = 'workspace-a', archived 
     return { status: response.status, data: data };
   }, { offset, account, archived, suffix });
 }
-async function setup({ items = sample(), nativeRequest = true, listStatus = 200, clock = false, lateInstall = false } = {}) {
-  const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, timezoneId: 'Asia/Shanghai' });
+async function setup({ items = sample(), nativeRequest = true, listStatus = 200, clock = false, lateInstall = false, context = null } = {}) {
+  const page = context ? await context.newPage() : await browser.newPage({ viewport: { width: 1280, height: 900 }, timezoneId: 'Asia/Shanghai' });
   if (clock) await page.clock.install({ time: new Date() });
   const state = { items, listStatus, requests: [], details: {} }, errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -161,6 +161,448 @@ test('right-click elsewhere, editable rows and unavailable menu buttons keep bro
     assert.ok(results.untouched.every(Boolean), 'unrelated context menus must not be cancelled');
     assert.equal(results.menuOpened, undefined);
     assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
+async function collectionPicker(page, id = 'a', openEditor = true) {
+  if (openEditor && !await page.locator(`[data-sidebar-cycle-item] a[href="/c/${id}"]`).isVisible()) {
+    const row = page.locator('.cst-collection-row').filter({ has: page.locator(`a[href="/c/${id}"]`) }).first();
+    await row.hover(); await row.getByRole('button', { name: /^调整收藏分组：/ }).click();
+    return page.getByRole('group', { name: '收藏分组编辑', exact: true });
+  }
+  await page.evaluate(id => {
+    const row = [...document.querySelectorAll('[data-sidebar-cycle-item]')].find(row => row.querySelector(`a[href="/c/${id}"]`));
+    const button = row.querySelector('button'); button.setAttribute('aria-haspopup', 'menu');
+    button.onclick = () => {
+      document.querySelector('#fixture-menu')?.remove();
+      const menu = document.createElement('div'); menu.id = 'fixture-menu'; menu.setAttribute('role', 'menu');
+      button.setAttribute('aria-controls', menu.id); button.setAttribute('aria-expanded', 'true');
+      const rename = document.createElement('button'); rename.textContent = '重命名'; rename.setAttribute('role', 'menuitem');
+      rename.className = 'native-menu-item'; rename.style.cssText = 'font:14px/20px Arial;padding:6px 10px;height:36px;box-sizing:border-box;border-radius:12px;display:flex;align-items:center'; menu.append(rename);
+      menu.addEventListener('keydown', event => { if (event.key === 'Escape') { menu.remove(); button.setAttribute('aria-expanded', 'false'); } });
+      document.body.append(menu);
+    };
+  }, id);
+  await page.locator(`[data-sidebar-cycle-item] a[href="/c/${id}"]`).locator('..').locator('button').click();
+  if (!openEditor) { await page.getByRole('menuitem', { name: '收藏到分组…' }).waitFor(); return; }
+  await page.getByRole('menuitem', { name: '收藏到分组…' }).click();
+  return page.getByRole('group', { name: '收藏分组编辑', exact: true });
+}
+
+test('collections survive reload, missing native rows and collapsed groups without extra requests', async () => {
+  const { page, state, errors } = await setup();
+  try {
+    const dialog = await collectionPicker(page);
+    await dialog.getByRole('checkbox', { name: '稍后再看' }).check();
+    await dialog.getByRole('button', { name: '保存', exact: true }).click();
+    const panel = page.getByRole('region', { name: '收藏分组' });
+    await page.waitForFunction(() => !!document.querySelector('.cst-collections a[href="/c/a"]'));
+    assert.equal(await panel.locator('a[href="/c/a"] .native-title').textContent(), '同名标题');
+    await panel.getByRole('button', { name: '折叠稍后再看', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('.cst-collection-group .cst-group-toggle')?.getAttribute('aria-expanded') === 'false');
+    await page.reload();
+    await nativeList(page); await settle(page);
+    assert.equal(await panel.getByRole('button', { name: '展开稍后再看', exact: true }).count(), 1);
+    await panel.getByRole('button', { name: '展开稍后再看', exact: true }).click(); await settle(page);
+    await page.evaluate(() => document.querySelector('#native-a').remove());
+    state.items = []; await nativeList(page); await settle(page);
+    assert.equal(await panel.locator('a[href="/c/a"]').isVisible(), true);
+    await panel.locator('.cst-collection-row').hover();
+    await panel.getByRole('button', { name: '从稍后再看移除：同名标题' }).click();
+    await page.waitForFunction(() => !document.querySelector('.cst-collections a[href="/c/a"]'));
+    assertNativeOnly(state, 3);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('multiple collections, rename and deleting a group only modify local memberships', async () => {
+  const { page, state } = await setup();
+  try {
+    let dialog = await collectionPicker(page);
+    await dialog.getByRole('checkbox', { name: '稍后再看' }).check();
+    await dialog.getByRole('textbox', { name: '新建分组（可选）' }).fill('工作');
+    await dialog.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    assert.equal(await page.locator('.cst-collections a[href="/c/a"]').count(), 2);
+    dialog = await collectionPicker(page, 'b');
+    await dialog.getByRole('checkbox', { name: '工作', exact: true }).check();
+    await dialog.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    await page.getByRole('button', { name: '编辑分组：工作' }).click();
+    dialog = page.getByRole('group', { name: '收藏分组编辑', exact: true }); await dialog.getByRole('textbox', { name: '分组名称' }).fill('资料');
+    await dialog.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    await page.getByRole('button', { name: '编辑分组：资料' }).click();
+    await dialog.getByRole('button', { name: '删除分组', exact: true }).click();
+    assert.equal(await page.locator('.cst-collections a[href="/c/b"]').count(), 1);
+    await dialog.getByRole('button', { name: '确认删除分组', exact: true }).click(); await settle(page);
+    assert.equal(await page.locator('.cst-collections a[href="/c/a"]').count(), 1);
+    assert.equal(await page.locator('.cst-collections a[href="/c/b"]').count(), 0);
+    assert.equal(await page.locator('#native-b').count(), 1);
+    assert.equal(await page.locator('#native-b').isVisible(), true);
+    assert.equal(await page.locator('#native-a').isVisible(), false);
+    assertNativeOnly(state, 1);
+    if (process.env.SCREENSHOT_DIR) {
+      fs.mkdirSync(process.env.SCREENSHOT_DIR, { recursive: true });
+      await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'collections-light.png') });
+      await page.getByRole('button', { name: '新建收藏分组' }).click();
+      await page.evaluate(() => document.documentElement.classList.add('dark'));
+      await page.setViewportSize({ width: 390, height: 844 });
+      await dialog.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'collections-inline-dark.png') });
+    }
+  } finally { await page.close(); }
+});
+
+test('collected conversations leave Recents and restore after their final membership is removed', async () => {
+  const { page, state, errors } = await setup();
+  try {
+    const native = page.locator('#native-a');
+    const dialog = await collectionPicker(page);
+    await dialog.getByRole('checkbox', { name: '稍后再看' }).check();
+    await dialog.getByRole('textbox', { name: '新建分组（可选）' }).fill('工作');
+    await dialog.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    assert.equal(await native.isVisible(), false);
+    assert.equal(await native.count(), 1);
+    assert.equal(await page.locator('.cst-group[data-group="0"]').isVisible(), false);
+    const panel = page.getByRole('region', { name: '收藏分组' });
+    const matching = await page.evaluate(() => {
+      const group = document.querySelector('.cst-collection-group .cst-group-toggle');
+      const date = document.querySelector('#native-list .cst-group[data-group="1"] .cst-group-toggle');
+      const bookmark = document.querySelector('.cst-collection-row a');
+      const recent = document.querySelector('#native-b a');
+      const style = node => { const s = getComputedStyle(node); return [s.fontFamily, s.fontSize, s.fontWeight, s.color]; };
+      return { group: style(group), date: style(date), bookmark: style(bookmark), recent: style(recent), groupX: group.getBoundingClientRect().x, dateX: date.getBoundingClientRect().x, bookmarkX: bookmark.getBoundingClientRect().x, recentX: recent.getBoundingClientRect().x };
+    });
+    assert.deepEqual(matching.group, matching.date);
+    assert.deepEqual(matching.bookmark, matching.recent);
+    assert.equal(matching.groupX, matching.dateX);
+    assert.equal(matching.bookmarkX, matching.recentX);
+    await panel.getByRole('button', { name: '折叠全部收藏', exact: true }).click(); await settle(page);
+    assert.equal(await native.isVisible(), false);
+    await page.reload(); await nativeList(page); await settle(page);
+    assert.equal(await native.isVisible(), false);
+    await panel.getByRole('button', { name: '展开全部收藏', exact: true }).click(); await settle(page);
+    await native.locator('a').evaluate(link => { link.href = '/c/recycled'; }); await settle(page);
+    assert.equal(await native.getAttribute('data-cst-collected'), 'false');
+    await page.locator('.cst-group[data-group="3"] button').click(); await settle(page);
+    assert.equal(await native.isVisible(), true, 'recycled native nodes must be checked by current ID');
+    await native.locator('a').evaluate(link => { link.href = '/c/a'; }); await settle(page);
+    assert.equal(await native.isVisible(), false);
+    const later = panel.locator('.cst-collection-group').filter({ has: page.getByRole('button', { name: '编辑分组：稍后再看' }) });
+    await later.locator('.cst-collection-row').hover();
+    await later.getByRole('button', { name: '从稍后再看移除：同名标题' }).click(); await settle(page);
+    assert.equal(await native.isVisible(), false, 'another membership still hides Recents');
+    await panel.locator('.cst-collection-row').click({ button: 'right' });
+    await dialog.getByRole('checkbox', { name: '工作', exact: true }).uncheck();
+    await dialog.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    assert.equal(await native.isVisible(), true);
+    assert.equal(await page.locator('.cst-group[data-group="0"] .cst-group-count').textContent(), '1');
+    assertNativeOnly(state, 2); assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('collecting all Recents hides empty date groups and leaves pinned rows visible', async () => {
+  const { page, state, errors } = await setup();
+  try {
+    const target = page.locator('.cst-collection-group .cst-collection-heading');
+    for (const toggle of await page.locator('.cst-group-toggle[aria-expanded="false"]').all()) await toggle.click();
+    await settle(page);
+    for (const id of ['a', 'b', 'week', 'old', 'pinned']) {
+      await dragIntoCollection(page, page.locator(`[data-sidebar-cycle-item] a[href="/c/${id}"]`), target);
+    }
+    assert.equal(await page.locator('#native-list > [id^="native-"]:visible').count(), 0);
+    assert.equal(await page.locator('.cst-group[data-group]:visible').count(), 0);
+    assert.equal(await page.locator('.cst-collections a').count(), 5);
+    assert.equal(await page.locator('[data-sidebar-cycle-item] a[href="/c/pinned"]').isVisible(), true);
+    assert.equal(await page.locator('[data-sidebar-cycle-item] a[href="/c/pinned"] time').count(), 1);
+    if (process.env.SCREENSHOT_DIR) {
+      await page.mouse.move(500, 100);
+      await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'collections-clean-recents.png') });
+    }
+    await page.evaluate(() => {
+      const key = Object.keys(localStorage).find(key => key.startsWith('cst:collections:'));
+      localStorage.setItem(key, '{broken'); window.dispatchEvent(new StorageEvent('storage', { key }));
+    }); await settle(page);
+    assert.equal(await page.locator('#native-list > [id^="native-"]:visible').count(), 4, 'invalid storage must not hide native conversations');
+    assertNativeOnly(state, 1); assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('collection rows reuse native markup, live unread and processing indicators, and native SPA clicks', async () => {
+  const { page, state, errors } = await setup();
+  try {
+    await page.evaluate(() => {
+      const row = document.querySelector('#native-a .sidebar-item'), link = row.querySelector('a');
+      window.originalNativeRow = row; window.documentIdentity = document;
+      row.classList.add('native-row-style'); link.classList.add('native-router-link');
+      row.querySelector('.native-title').id = 'native-title-id';
+      const unread = document.createElement('span'); unread.className = 'native-blue-dot'; unread.setAttribute('aria-label', '未读消息'); row.append(unread);
+      const processing = document.createElement('span'); processing.setAttribute('role', 'status'); processing.setAttribute('aria-label', '正在处理'); row.append(processing);
+      link.onclick = event => {
+        event.preventDefault(); window.nativeSwitchCalls = (window.nativeSwitchCalls || 0) + 1;
+        history.pushState({ idx: 1, key: 'native-chat' }, '', link.getAttribute('href'));
+        document.querySelector('main h1').textContent = '原生聊天内容已切换'; unread.remove();
+      };
+    });
+    const editor = await collectionPicker(page);
+    await editor.getByRole('checkbox', { name: '稍后再看' }).check();
+    await editor.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    const bookmark = page.locator('.cst-collection-row');
+    assert.equal(await bookmark.locator('.native-row-style a.native-router-link').count(), 1);
+    assert.equal(await bookmark.getByLabel('未读消息').count(), 1);
+    assert.equal(await bookmark.getByRole('status', { name: '正在处理' }).count(), 1);
+    assert.equal(await bookmark.locator('[id]').count(), 0);
+    assert.equal(await bookmark.locator('time').getAttribute('datetime'), await page.locator('#native-a time').getAttribute('datetime'));
+    const icons = await page.locator('.cst-collection-icon').evaluateAll(buttons => buttons.every(button => button.querySelector('svg') && !button.textContent.trim() && button.getAttribute('aria-label') && button.title));
+    assert.equal(icons, true);
+    await page.evaluate(() => document.querySelector('#native-a [role="status"]').remove()); await settle(page);
+    assert.equal(await bookmark.getByRole('status').count(), 0);
+    await page.locator('#composer').fill('保留草稿');
+    await bookmark.locator('.native-title').click(); await settle(page);
+    assert.equal(page.url(), 'https://chatgpt.com/c/a');
+    assert.equal(await page.locator('main h1').textContent(), '原生聊天内容已切换');
+    assert.equal(await page.locator('#composer').inputValue(), '保留草稿');
+    assert.deepEqual(await page.evaluate(() => [window.nativeSwitchCalls, document === window.documentIdentity, document.querySelector('#native-a .sidebar-item') === window.originalNativeRow]), [1, true, true]);
+    assert.equal(await bookmark.getByLabel('未读消息').count(), 0);
+    await bookmark.hover(); await bookmark.getByRole('button', { name: '调整收藏分组：同名标题' }).click();
+    const draft = page.getByRole('textbox', { name: '新建分组（可选）' }); await draft.fill('输入未完成');
+    await page.evaluate(() => { const list = document.querySelector('#native-list'); list.replaceWith(list.cloneNode(true)); }); await settle(page);
+    assert.equal(await bookmark.locator('time').count(), 1, 'native list replacement must rebuild collection timestamps even while editing');
+    assert.equal(await draft.inputValue(), '输入未完成');
+    await draft.press('Escape');
+    assertNativeOnly(state, 1); assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('unloaded collection links notify the page router without a document navigation and keep back/forward history', async () => {
+  const items = sample(); items[0].update_time = new Date(Date.now() - 90000).toISOString();
+  const { page, state, errors } = await setup({ items });
+  try {
+    const editor = await collectionPicker(page);
+    await editor.getByRole('checkbox', { name: '稍后再看' }).check();
+    await editor.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    await page.evaluate(() => {
+      window.documentIdentity = document; history.replaceState({ idx: 0, key: 'home' }, '', '/');
+      document.querySelector('#native-a').remove();
+      window.addEventListener('popstate', () => { document.querySelector('main h1').textContent = '页面内容：' + location.pathname; });
+    }); await settle(page);
+    const link = page.locator('.cst-collections a[href="/c/a"]');
+    await link.click(); await settle(page);
+    assert.equal(await page.locator('main h1').textContent(), '页面内容：/c/a');
+    assert.equal(await link.getAttribute('aria-current'), 'page');
+    const length = await page.evaluate(() => history.length);
+    await link.click(); assert.equal(await page.evaluate(() => history.length), length);
+    await page.goBack(); assert.equal(await page.locator('main h1').textContent(), '页面内容：/');
+    await page.goForward(); assert.equal(await page.locator('main h1').textContent(), '页面内容：/c/a');
+    assert.equal(await page.evaluate(() => document === window.documentIdentity && history.state.idx === 1), true);
+    await settle(page); assert.equal(await link.locator('time').textContent(), '1分钟前');
+    await page.clock.setFixedTime(new Date(Date.now() + 120000));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange'))); await settle(page);
+    assert.equal(await link.locator('time').textContent(), '3分钟前', 'unloaded collection times must also advance locally');
+    assertNativeOnly(state, 1); assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('inline collection inputs support Enter and Escape and retain drafts during native updates without popups', async () => {
+  const { page, state, errors } = await setup();
+  try {
+    page.on('dialog', () => assert.fail('collection actions must never open a browser popup'));
+    await page.getByRole('button', { name: '新建收藏分组' }).click();
+    const input = page.getByRole('textbox', { name: '分组名称' });
+    assert.equal(await page.locator('dialog,[role="dialog"]').count(), 0);
+    assert.equal(await input.evaluate(node => !!node.closest('.cst-collections')), true);
+    await input.fill('工作'); await input.press('Enter'); await settle(page);
+    await page.getByRole('button', { name: '编辑分组：工作' }).click();
+    await input.fill('尚未保存');
+    await nativeList(page); await settle(page);
+    assert.equal(await input.inputValue(), '尚未保存');
+    assert.equal(await input.evaluate(node => node === document.activeElement), true);
+    await input.press('Escape'); await settle(page);
+    assert.equal(await page.getByRole('button', { name: '编辑分组：工作' }).count(), 1);
+    await page.getByRole('button', { name: '编辑分组：工作' }).click();
+    await input.fill('资料'); await input.press('Enter'); await settle(page);
+    assert.equal(await page.getByRole('button', { name: '编辑分组：资料' }).count(), 1);
+    assert.equal(await page.locator('.cst-collection-editor,dialog,[role="dialog"]').count(), 0);
+    assertNativeOnly(state, 2); assert.deepEqual(errors, []);
+    if (process.env.SCREENSHOT_DIR) {
+      await page.getByRole('button', { name: '编辑分组：资料' }).click();
+      await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'inline-input-light.png') });
+      await page.evaluate(() => document.documentElement.classList.add('dark'));
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'inline-input-dark.png') });
+    }
+  } finally { await page.close(); }
+});
+
+test('collection account switches close editors and isolate saved data', async () => {
+  const { page, state } = await setup();
+  try {
+    const dialog = await collectionPicker(page);
+    await dialog.getByRole('checkbox', { name: '稍后再看' }).check();
+    await dialog.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    await collectionPicker(page);
+    await nativeList(page, { account: 'workspace-b' }); await settle(page);
+    assert.equal(await page.getByRole('group', { name: '收藏分组编辑', exact: true }).count(), 0);
+    assert.equal(await page.locator('.cst-collections a').count(), 0);
+    assert.equal(await page.locator('#native-a').isVisible(), true);
+    await nativeList(page, { account: 'workspace-a' }); await settle(page);
+    assert.equal(await page.locator('.cst-collections a[href="/c/a"]').count(), 1);
+    assert.equal(await page.locator('#native-a').isVisible(), false);
+    assertNativeOnly(state, 3);
+  } finally { await page.close(); }
+});
+
+test('collection write failure stays visible and malformed storage is never overwritten', async () => {
+  const { page, state } = await setup();
+  try {
+    const dialog = await collectionPicker(page);
+    await dialog.getByRole('checkbox', { name: '稍后再看' }).check();
+    await page.evaluate(() => {
+      const set = Storage.prototype.setItem;
+      window.restoreCollectionStorage = () => { Storage.prototype.setItem = set; };
+      Storage.prototype.setItem = function(key, value) { if (key.startsWith('cst:collections:')) throw new Error('QuotaExceededError'); return set.call(this, key, value); };
+    });
+    await dialog.getByRole('button', { name: '保存', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('.cst-collection-error')?.textContent.includes('QuotaExceededError'));
+    assert.equal(await dialog.isVisible(), true);
+    await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    const key = await page.evaluate(() => {
+      window.restoreCollectionStorage();
+      const key = 'cst:collections:v1:' + encodeURIComponent(JSON.stringify(['', 'workspace-a']));
+      localStorage.setItem(key, '{broken'); window.dispatchEvent(new StorageEvent('storage', { key })); return key;
+    });
+    await page.waitForFunction(() => document.querySelector('.cst-collections [role="alert"]')?.textContent.includes('格式异常'));
+    assert.equal(await page.getByRole('button', { name: '新建收藏分组' }).isDisabled(), true);
+    assert.equal(await page.evaluate(key => localStorage.getItem(key), key), '{broken');
+    assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
+test('collection writes across tabs merge under a lock and keyboard navigation reaches the added action', async () => {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, timezoneId: 'Asia/Shanghai' });
+  const { page, state } = await setup({ context });
+  const second = await page.context().newPage();
+  try {
+    let secondRequests = 0;
+    await second.route('**/*', route => {
+      if (new URL(route.request().url()).pathname === '/') return route.fulfill({ contentType: 'text/html', body: fixture });
+      secondRequests++; return route.fulfill({ json: { items: sample() } });
+    });
+    await second.addInitScript({ content: script }); await second.goto('https://chatgpt.com/');
+    await second.evaluate(async () => (await fetch('/backend-api/conversations', { headers: { 'chatgpt-account-id': 'workspace-a' } })).json());
+    await second.waitForFunction(() => !!document.querySelector('.cst-collections'));
+    await page.getByRole('button', { name: '新建收藏分组' }).click();
+    await second.getByRole('button', { name: '新建收藏分组' }).click();
+    await page.getByRole('textbox', { name: '分组名称' }).fill('工作');
+    await second.getByRole('textbox', { name: '分组名称' }).fill('学习');
+    await Promise.all([page.getByRole('button', { name: '保存', exact: true }).click(), second.getByRole('button', { name: '保存', exact: true }).click()]);
+    await page.waitForFunction(() => document.querySelectorAll('.cst-collection-group').length === 3);
+    await second.waitForFunction(() => document.querySelectorAll('.cst-collection-group').length === 3);
+    // Install the native fixture menu using the existing helper, then exercise its keyboard path.
+    const dialog = await collectionPicker(page); await dialog.getByRole('button', { name: '取消', exact: true }).click();
+    await page.locator('#native-menu').click();
+    await page.getByRole('menuitem', { name: '收藏到分组…' }).waitFor();
+    await page.getByRole('menuitem', { name: '重命名', exact: true }).focus();
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.getByRole('menuitem', { name: '收藏到分组…' }).evaluate(n => n === document.activeElement), true);
+    await page.keyboard.press('Enter');
+    assert.equal(await page.getByRole('group', { name: '收藏分组编辑', exact: true }).isVisible(), true);
+    assert.equal(secondRequests, 1); assertNativeOnly(state, 1);
+  } finally { await context.close(); }
+});
+
+test('collection menu inherits native item typography and layout, and the whole section collapse survives reload', async () => {
+  const { page, state } = await setup();
+  try {
+    await collectionPicker(page, 'a', false);
+    const styles = await page.locator('[role="menuitem"]').evaluateAll(items => items.map(item => {
+      const style = getComputedStyle(item);
+      return ['fontFamily', 'fontSize', 'fontWeight', 'lineHeight', 'letterSpacing', 'height', 'padding', 'borderRadius'].map(key => style[key]);
+    }));
+    assert.deepEqual(styles[1], styles[0]);
+    assert.equal(await page.locator('.cst-collection-menu-action.native-menu-item').count(), 1);
+    await page.getByRole('menu').press('Escape');
+    await page.getByRole('button', { name: '折叠全部收藏', exact: true }).click(); await settle(page);
+    assert.equal(await page.locator('.cst-collection-groups').isVisible(), false);
+    await page.reload(); await nativeList(page); await settle(page);
+    assert.equal(await page.getByRole('button', { name: '展开全部收藏', exact: true }).count(), 1);
+    await page.getByRole('button', { name: '展开全部收藏', exact: true }).click(); await settle(page);
+    assert.equal(await page.getByRole('button', { name: '折叠稍后再看', exact: true }).isVisible(), true);
+    assertNativeOnly(state, 2);
+  } finally { await page.close(); }
+});
+
+async function createCollection(page, name) {
+  await page.getByRole('button', { name: '新建收藏分组' }).click();
+  await page.getByRole('textbox', { name: '分组名称' }).fill(name);
+  await page.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+}
+async function dragIntoCollection(page, source, target, cancel = false) {
+  const from = await source.boundingBox(), to = await target.boundingBox();
+  await page.mouse.move(from.x + 12, from.y + from.height / 2); await page.mouse.down();
+  await page.mouse.move(from.x + 24, from.y + from.height / 2, { steps: 3 });
+  await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 15 });
+  if (cancel) await page.keyboard.press('Escape');
+  await page.mouse.up(); await settle(page);
+}
+
+test('dragging native conversations into collapsed groups adds bookmarks; dragging bookmarks moves only that membership', async () => {
+  const { page, state, errors } = await setup();
+  try {
+    await createCollection(page, '工作'); await createCollection(page, '学习');
+    const work = page.locator('.cst-collection-group').filter({ has: page.getByRole('button', { name: '编辑分组：工作' }) });
+    const study = page.locator('.cst-collection-group').filter({ has: page.getByRole('button', { name: '编辑分组：学习' }) });
+    await work.getByRole('button', { name: '折叠工作', exact: true }).click(); await settle(page);
+    await dragIntoCollection(page, page.locator('#native-a a'), work.locator('.cst-collection-heading'));
+    assert.equal(await work.locator('a[href="/c/a"]').isVisible(), true);
+    assert.equal(await page.locator('#native-a').count(), 1);
+    assert.equal(await page.locator('#native-a a').getAttribute('draggable'), null);
+    assert.equal(await page.locator('#native-a').isVisible(), false);
+    await dragIntoCollection(page, work.locator('a[href="/c/a"]'), work.locator('.cst-collection-heading'));
+    assert.equal(await work.locator('a[href="/c/a"]').count(), 1);
+    const dialog = await collectionPicker(page);
+    await dialog.getByRole('checkbox', { name: '稍后再看' }).check();
+    await dialog.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    await dragIntoCollection(page, work.locator('a[href="/c/a"]'), study.locator('.cst-collection-heading'));
+    assert.equal(await work.locator('a').count(), 0);
+    assert.equal(await study.locator('a[href="/c/a"]').count(), 1);
+    assert.equal(await page.locator('.cst-collections a[href="/c/a"]').count(), 2);
+    assert.equal(await page.locator('#native-a').count(), 1);
+    assert.equal(page.url(), 'https://chatgpt.com/');
+    assertNativeOnly(state, 1); assert.deepEqual(errors, []);
+    if (process.env.SCREENSHOT_DIR) await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'collections-drag-result.png') });
+  } finally { await page.close(); }
+});
+
+test('cancelled or outside drops leave storage intact, and ordinary clicks keep native behavior', async () => {
+  const { page, state } = await setup();
+  try {
+    await createCollection(page, '工作');
+    const before = await page.evaluate(() => JSON.stringify(localStorage));
+    await dragIntoCollection(page, page.locator('#native-b a'), page.locator('main h1'));
+    await dragIntoCollection(page, page.locator('#native-b a'), page.getByRole('button', { name: '折叠工作', exact: true }), true);
+    assert.equal(await page.evaluate(() => JSON.stringify(localStorage)), before);
+    assert.equal(await page.locator('[data-cst-drop-active],.cst-collection-drag').count(), 0);
+    await page.locator('#native-b a').evaluate(link => link.addEventListener('click', event => { event.preventDefault(); document.body.dataset.linkClicked = 'yes'; }));
+    await page.locator('#native-b a').click();
+    assert.equal(await page.locator('body').getAttribute('data-link-clicked'), 'yes');
+    assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
+test('switching workspace mid-drag cancels the move and restores native draggable state', async () => {
+  const { page, state } = await setup();
+  try {
+    await createCollection(page, '工作');
+    const before = await page.evaluate(() => JSON.stringify(localStorage));
+    const from = await page.locator('#native-b a').boundingBox();
+    const to = await page.getByRole('button', { name: '折叠工作', exact: true }).boundingBox();
+    await page.mouse.move(from.x + 12, from.y + from.height / 2); await page.mouse.down();
+    await page.mouse.move(to.x + 12, to.y + to.height / 2, { steps: 15 });
+    assert.equal(await page.locator('.cst-collection-drag').count(), 1);
+    await nativeList(page, { account: 'workspace-b' }); await settle(page); await page.mouse.up();
+    assert.equal(await page.locator('.cst-collection-drag,[data-cst-drop-active]').count(), 0);
+    assert.equal(await page.locator('#native-b a').getAttribute('draggable'), null);
+    assert.equal(await page.evaluate(() => JSON.stringify(localStorage)), before);
+    assert.equal(await page.locator('.cst-collections a').count(), 0);
+    assertNativeOnly(state, 2);
   } finally { await page.close(); }
 });
 
@@ -309,7 +751,7 @@ test('no native list request means zero script requests, even after an hour and 
     await settle(page, true);
     assert.equal(await page.evaluate(() => window.hostFetchCalls), 0);
     assertNativeOnly(state, 0);
-    assert.equal(await page.locator('.cst-time, .cst-group, .cst-tools, .cst-check, .cst-status, .cst-more, .cst-dialog').count(), 0);
+    assert.equal(await page.locator('.cst-time, .cst-group[data-group], .cst-tools, .cst-check, .cst-status, .cst-more, .cst-dialog').count(), 0);
     assert.equal(await page.locator('#native-a').isVisible(), true);
     assert.equal(await page.locator('#native-old').isVisible(), true);
     assert.deepEqual(errors, []);
@@ -329,7 +771,7 @@ test('native pins responses annotate pinned chats even when Recents is absent, w
     assert.equal(await pin.locator('time').textContent(), '1小时前');
     assert.equal(await page.evaluate(() => window.hostFetchCalls), 1);
     assert.equal(state.requests.length, 0);
-    assert.equal(await page.locator('.cst-tools, .cst-group').count(), 0);
+    assert.equal(await page.locator('.cst-tools, .cst-group[data-group]').count(), 0);
     assert.deepEqual(errors, []);
   } finally { await page.close(); }
 });
@@ -341,7 +783,7 @@ test('a single native response supplies relative times, nonempty groups and nati
     assertNativeOnly(state, 1);
     assert.equal(await page.evaluate(() => window.samePromise), true);
     assert.deepEqual(await page.evaluate(() => window.nativeResponse.items.map(x => x.id)), items.map(x => x.id));
-    assert.deepEqual(await page.locator('.cst-group-count').allTextContents(), ['1', '1', '1', '1']);
+    assert.deepEqual(await page.locator('#native-list .cst-group-count').allTextContents(), ['1', '1', '1', '1']);
     assert.equal(await page.locator('#native-a .cst-time').textContent(), '1小时前');
     assert.notEqual(await page.locator('#native-a time').getAttribute('datetime'), await page.locator('#native-b time').getAttribute('datetime'));
     await page.locator('#native-menu').click();
@@ -377,7 +819,7 @@ test('late installation leaves cached rows alone until ChatGPT itself supplies m
   try {
     await page.clock.fastForward(3600000); await settle(page, true);
     assertNativeOnly(state, 1);
-    assert.equal(await page.locator('.cst-time, .cst-group').count(), 0);
+    assert.equal(await page.locator('.cst-time, .cst-group[data-group]').count(), 0);
     await nativeList(page); await settle(page, true);
     assertNativeOnly(state, 2);
     assert.equal(await page.locator('#native-a .cst-time').count(), 1);
@@ -390,13 +832,13 @@ test('group collapse preferences survive reload and hidden empty groups without 
     for (let i = 0; i < 4; i++) await page.locator('.cst-group[data-group="' + i + '"] button').click();
     await settle(page);
     const expected = ['false', 'false', 'false', 'true'];
-    assert.deepEqual(await page.locator('.cst-group-toggle').evaluateAll(nodes => nodes.map(n => n.getAttribute('aria-expanded'))), expected);
+    assert.deepEqual(await page.locator('#native-list .cst-group-toggle').evaluateAll(nodes => nodes.map(n => n.getAttribute('aria-expanded'))), expected);
     assertNativeOnly(state, 1);
     await page.reload(); await settle(page);
     assertNativeOnly(state, 1, 'page reload alone must not fetch metadata');
     await nativeList(page);
-    await page.waitForFunction(() => document.querySelectorAll('.cst-group').length === 4);
-    assert.deepEqual(await page.locator('.cst-group-toggle').evaluateAll(nodes => nodes.map(n => n.getAttribute('aria-expanded'))), expected);
+    await page.waitForFunction(() => document.querySelectorAll('.cst-group[data-group]').length === 4);
+    assert.deepEqual(await page.locator('#native-list .cst-group-toggle').evaluateAll(nodes => nodes.map(n => n.getAttribute('aria-expanded'))), expected);
     await page.evaluate(() => document.querySelector('#native-b').remove());
     await settle(page);
     assert.equal(await page.locator('.cst-group[data-group="1"]').isVisible(), false);
@@ -494,7 +936,7 @@ test('an empty native sidebar has no empty headers, notices, buttons or active r
     await page.evaluate(() => { document.querySelector('#native-list').replaceChildren(); });
     await nativeList(page); await settle(page, true);
     await page.clock.fastForward(3600000); await settle(page, true);
-    assert.equal(await page.locator('.cst-group, .cst-time, .cst-tools, .cst-status').count(), 0);
+    assert.equal(await page.locator('.cst-group[data-group], .cst-time, .cst-tools, .cst-status').count(), 0);
     assertNativeOnly(state, 1);
   } finally { await page.close(); }
 });

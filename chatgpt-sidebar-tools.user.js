@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT 原生侧边栏助手
 // @namespace    local.chatgpt.sidebar-tools
-// @version      2.3.3
-// @description  原生对话相对时间、可折叠分组与右键菜单快捷操作；不主动发起任何网络请求。
+// @version      2.7.1
+// @description  原生对话时间、日期分组、本地收藏分组与右键菜单；不主动发起任何网络请求。
 // @author       ahang39
 // @homepageURL  https://github.com/ahang39/chatgpt-sidebar-tools
 // @supportURL   https://github.com/ahang39/chatgpt-sidebar-tools/issues
@@ -21,6 +21,27 @@
   const ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
   const GROUPS = ['今天', '昨天', '最近一周', '更多'];
   const PREF_KEY = 'cst:preferences:v1';
+  const COLLECTION_PREFIX = 'cst:collections:v1:';
+
+  function collectionData(raw) {
+    if (raw === null) return { version: 1, collapsed: false, groups: [{ id: 'later', name: '稍后再看', collapsed: false }], items: [] };
+    const fail = () => { throw new Error('收藏数据格式异常，请先备份网站数据；原数据未被覆盖。'); };
+    let data;
+    try { data = JSON.parse(raw); } catch { fail(); }
+    if (data?.version !== 1 || !Array.isArray(data.groups) || !Array.isArray(data.items)) fail();
+    if (data.collapsed === undefined) data.collapsed = false;
+    if (typeof data.collapsed !== 'boolean') fail();
+    const groups = new Set(), items = new Set();
+    for (const group of data.groups) {
+      if (typeof group?.id !== 'string' || !ID.test(group.id) || groups.has(group.id) || typeof group.name !== 'string' || !group.name.trim() || group.name.length > 60 || typeof group.collapsed !== 'boolean') fail();
+      groups.add(group.id);
+    }
+    for (const item of data.items) {
+      if (typeof item?.id !== 'string' || !ID.test(item.id) || items.has(item.id) || typeof item.title !== 'string' || item.title.length > 300 || !Array.isArray(item.groups) || !item.groups.length || new Set(item.groups).size !== item.groups.length || item.groups.some(id => !groups.has(id))) fail();
+      items.add(item.id);
+    }
+    return data;
+  }
 
   function timestamp(value) {
     if (value === null || value === undefined || value === '') return null;
@@ -113,7 +134,7 @@
   }
 
   if (typeof document === 'undefined') {
-    if (typeof module !== 'undefined') module.exports = { timestamp, normalize, groupFor, sorted, conversationId, relativeTime, sseParser, pinItems };
+    if (typeof module !== 'undefined') module.exports = { timestamp, normalize, groupFor, sorted, conversationId, relativeTime, sseParser, pinItems, collectionData };
     return;
   }
   if (window !== window.top || window.__cstInstalled) return;
@@ -125,6 +146,9 @@
   const records = new Map();
   const activity = new Map(), readers = new Set();
   let cookie = workspace(), account = '', generation = 0, timer = null, currentList = null;
+  let collectionPanel = null, collectionSignature = '', collectionEditor = null, menuTarget = null;
+  let collectionDrag = null, suppressCollectionClick = null;
+  const collectionRowSignatures = new WeakMap();
 
   function workspace() {
     return document.cookie.split(';').map(x => x.trim()).find(x => x.startsWith('_account=')) || '';
@@ -132,7 +156,11 @@
   function updateScope(nextAccount = '') {
     const nextCookie = workspace();
     if (nextCookie !== cookie || (nextAccount && nextAccount !== account)) {
-      cookie = nextCookie; account = nextAccount; generation++; records.clear(); activity.clear();
+      account = nextCookie !== cookie ? nextAccount : nextAccount || account;
+      cookie = nextCookie; generation++; records.clear(); activity.clear();
+      collectionPanel?.remove(); collectionPanel = null; collectionSignature = ''; menuTarget = null;
+      closeCollectionEditor();
+      cancelCollectionDrag();
       for (const reader of readers) void reader.cancel().catch(() => {});
       schedule();
     }
@@ -271,9 +299,10 @@
     });
   }
   function clear() {
+    for (const row of collectionPanel?.querySelectorAll('.cst-collection-row') || []) collectionRowSignatures.delete(row);
     for (const node of document.querySelectorAll('[data-cst-owned="group"], [data-cst-owned="time"]')) node.remove();
-    for (const node of document.querySelectorAll('[data-cst-list], [data-cst-link], [data-cst-shell], [data-cst-row], [data-cst-collapsed], [data-cst-sidebar]')) {
-      for (const name of ['data-cst-list', 'data-cst-link', 'data-cst-shell', 'data-cst-row', 'data-cst-collapsed', 'data-cst-sidebar']) node.removeAttribute(name);
+    for (const node of document.querySelectorAll('[data-cst-list], [data-cst-link], [data-cst-shell], [data-cst-row], [data-cst-collapsed], [data-cst-sidebar], [data-cst-collected]')) {
+      for (const name of ['data-cst-list', 'data-cst-link', 'data-cst-shell', 'data-cst-row', 'data-cst-collapsed', 'data-cst-sidebar', 'data-cst-collected']) node.removeAttribute(name);
       node.style.removeProperty('--cst-order');
       node.style.removeProperty('--cst-recency-color');
       node.style.removeProperty('--cst-recency-weight');
@@ -328,6 +357,351 @@
     attr(toggle, 'aria-label', (collapsed[index] ? '展开' : '折叠') + GROUPS[index] + '，' + count + ' 个对话');
     setText(header.querySelector('.cst-group-count'), String(count));
   }
+
+  // Wait for the native account header: an unidentified page must not share bookmarks.
+  function collectionKey() { return account ? COLLECTION_PREFIX + encodeURIComponent(JSON.stringify([cookie, account])) : null; }
+  function readCollections(key) { return collectionData(localStorage.getItem(key)); }
+  async function changeCollections(key, change) {
+    if (!key || key !== collectionKey()) throw new Error('账号或工作区已变化，请重新打开收藏。');
+    if (!navigator.locks) throw new Error('当前浏览器不支持安全的多标签页收藏写入。');
+    await navigator.locks.request(key, () => {
+      if (key !== collectionKey()) throw new Error('账号或工作区已变化，请重新打开收藏。');
+      const data = readCollections(key);
+      change(data);
+      const text = JSON.stringify(data); collectionData(text);
+      localStorage.setItem(key, text);
+    });
+    collectionSignature = ''; schedule();
+  }
+  function collectionButton(label, action) {
+    const button = document.createElement('button'); button.type = 'button'; button.textContent = label;
+    button.addEventListener('click', action); return button;
+  }
+  function collectionIcon(label, path, action) {
+    const button = collectionButton('', action);
+    const reference = document.querySelector('nav button[aria-haspopup="menu"]');
+    button.className = (reference?.className || '') + ' cst-collection-icon';
+    for (const name of ['data-color', 'data-variant', 'data-uniform', 'data-size']) if (reference?.hasAttribute(name)) button.setAttribute(name, reference.getAttribute(name));
+    button.setAttribute('aria-label', label); button.title = label;
+    const svg = chevron(); svg.firstElementChild.setAttribute('d', path); button.append(svg);
+    return button;
+  }
+  function closeCollectionEditor() {
+    collectionEditor?.remove(); collectionEditor = null; collectionSignature = ''; schedule();
+  }
+  function collectionError(message) {
+    if (!collectionPanel) return;
+    let notice = collectionPanel.querySelector(':scope > .cst-collection-error');
+    if (!notice) { notice = document.createElement('p'); notice.className = 'cst-collection-error'; notice.setAttribute('role', 'alert'); collectionPanel.append(notice); }
+    notice.textContent = message;
+  }
+  function editCollections(item = null, group = null, anchor = null) {
+    const key = collectionKey();
+    if (!key || !collectionPanel?.isConnected) return;
+    closeCollectionEditor();
+    const editor = owned('div', 'collection-editor'); editor.className = 'cst-collection-editor';
+    editor.setAttribute('role', 'group'); editor.setAttribute('aria-label', '收藏分组编辑');
+    collectionEditor = editor;
+    const form = document.createElement('form');
+    const status = document.createElement('p'); status.setAttribute('role', 'alert'); status.className = 'cst-collection-error';
+    const nameLabel = document.createElement('label'), name = document.createElement('input');
+    name.type = 'text'; name.maxLength = 60; name.value = group?.name || ''; name.required = !item;
+    const inputLabel = item ? '新建分组（可选）' : '分组名称';
+    name.setAttribute('aria-label', inputLabel); name.placeholder = inputLabel; nameLabel.append(name);
+    const choices = document.createElement('fieldset'); choices.className = 'cst-collection-choices';
+    const legend = document.createElement('legend'); legend.textContent = item?.title || '选择分组'; choices.append(legend);
+    try {
+      const data = readCollections(key);
+      if (item) for (const entry of data.groups) {
+        const label = document.createElement('label'), check = document.createElement('input');
+        check.type = 'checkbox'; check.value = entry.id;
+        check.checked = data.items.find(x => x.id === item.id)?.groups.includes(entry.id) || false;
+        label.append(check, document.createTextNode(entry.name)); choices.append(label);
+      }
+    } catch (error) { status.textContent = error.message; }
+    const actions = document.createElement('div'); actions.className = 'cst-collection-actions';
+    const cancel = collectionIcon('取消', 'm18 6-12 12M6 6l12 12', closeCollectionEditor);
+    const save = collectionIcon('保存', 'm20 6-11 11-5-5', () => {}); save.type = 'submit';
+    actions.append(save, cancel);
+    if (group) {
+      const remove = collectionIcon('删除分组', 'M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6', async () => {
+        if (remove.dataset.confirm !== 'true') {
+          remove.dataset.confirm = 'true'; remove.setAttribute('aria-label', '确认删除分组'); remove.title = '确认删除分组';
+          status.textContent = '仅移除此分组及其中的收藏关系，不删除 ChatGPT 对话。'; return;
+        }
+        remove.disabled = true;
+        try {
+          await changeCollections(key, data => {
+            data.groups = data.groups.filter(x => x.id !== group.id);
+            for (const entry of data.items) entry.groups = entry.groups.filter(id => id !== group.id);
+            data.items = data.items.filter(x => x.groups.length);
+          }); closeCollectionEditor();
+        } catch (error) { status.textContent = '无法保存：' + error.message; remove.disabled = false; }
+      });
+      remove.classList.add('cst-collection-delete'); actions.prepend(remove);
+    }
+    form.addEventListener('submit', async event => {
+      event.preventDefault(); save.disabled = true;
+      const selected = [...choices.querySelectorAll('input:checked')].map(x => x.value), title = name.value.trim();
+      try {
+        await changeCollections(key, data => {
+          if (!item && !title) throw new Error('请输入分组名称。');
+          if (group) {
+            const entry = data.groups.find(x => x.id === group.id);
+            if (!entry) throw new Error('分组已变化，请重新打开。');
+            if (data.groups.some(x => x.id !== group.id && x.name === title)) throw new Error('已存在同名分组。');
+            entry.name = title;
+          } else if (title) {
+            let entry = data.groups.find(x => x.name === title);
+            if (!entry) { entry = { id: crypto.randomUUID(), name: title, collapsed: false }; data.groups.push(entry); }
+            data.collapsed = false;
+            if (item) selected.push(entry.id);
+          }
+          if (item) {
+            if (selected.some(id => !data.groups.some(g => g.id === id))) throw new Error('分组已变化，请重新打开。');
+            data.items = data.items.filter(x => x.id !== item.id);
+            if (selected.length) data.items.push({ id: item.id, title: item.title, groups: [...new Set(selected)] });
+          }
+        }); closeCollectionEditor();
+      } catch (error) { status.textContent = '无法保存：' + error.message; save.disabled = false; }
+    });
+    if (item) form.append(choices);
+    const inputRow = document.createElement('div'); inputRow.className = 'cst-collection-input-row'; inputRow.append(nameLabel, actions);
+    form.append(inputRow, status); editor.append(form);
+    const host = anchor?.closest('.cst-collection-row,.cst-collection-heading') || collectionPanel.querySelector('.cst-collection-heading');
+    host.after(editor);
+    editor.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); closeCollectionEditor(); } });
+    name.focus(); if (group) name.select();
+  }
+  function nativeCollectionRows(nav) {
+    const result = new Map();
+    for (const link of nav.querySelectorAll('a[href*="/c/"]')) {
+      if (link.closest('[data-cst-owned="collections"]')) continue;
+      const id = conversationId(link.getAttribute('href'));
+      if (id && !result.has(id)) result.set(id, { id, link, shell: link.closest('[data-sidebar-cycle-item],.sidebar-item,[data-testid^="history-item-"]') || link });
+    }
+    return result;
+  }
+  function openCollectionChat(event, id) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || !event.target.closest('a[href*="/c/"]')) return;
+    event.preventDefault(); event.stopPropagation();
+    const source = nativeCollectionRows(collectionPanel.closest('nav,aside')).get(id);
+    if (source) { source.link.click(); return; }
+    // Unloaded bookmarks have no native Link; notify the page's History router without loading a document.
+    const href = '/c/' + id;
+    if (location.pathname !== href) {
+      history.pushState({ usr: null, key: crypto.randomUUID(), idx: (history.state?.idx || 0) + 1 }, '', href);
+      window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+    }
+    schedule();
+  }
+  function renderCollectionRows(nav) {
+    if (!nav || !collectionPanel || collectionDrag?.active) return;
+    const sources = nativeCollectionRows(nav), template = [...sources.values()].find(row => !row.link.hasAttribute('aria-current')) || sources.values().next().value;
+    for (const row of collectionPanel.querySelectorAll('.cst-collection-row')) {
+      const id = row.dataset.conversationId, source = sources.get(id), content = row.querySelector('.cst-collection-native');
+      const signature = source ? source.shell.outerHTML : JSON.stringify([template?.shell.className, records.get(id)?.title || row.dataset.title, dateFor({ id }), relativeTime(dateFor({ id })), location.pathname]);
+      if (collectionRowSignatures.get(row) === signature) continue;
+      collectionRowSignatures.set(row, signature);
+      let shell, link;
+      if (source) {
+        shell = source.shell.cloneNode(true);
+        // Keep the native title and status rail, but local collection actions have their own handlers.
+        for (const node of shell.querySelectorAll('[data-hover-card-open-immediately],button')) node.remove();
+        link = shell.matches('a') ? shell : shell.querySelector('a[href*="/c/"]');
+      } else {
+        shell = document.createElement('div'); shell.className = template?.shell.className || '';
+        link = document.createElement('a'); link.className = template?.link.className || '';
+        const title = template?.link.querySelector('[data-thread-title],.native-title')?.cloneNode(false) || document.createElement('span');
+        title.textContent = records.get(id)?.title || row.dataset.title; link.append(title); shell.append(link);
+      }
+      for (const node of [shell, ...shell.querySelectorAll('*')]) {
+        for (const name of ['id', 'aria-controls', 'aria-describedby', 'aria-labelledby', 'data-sidebar-cycle-item', 'data-testid', 'data-cst-collected', 'data-cst-collapsed']) node.removeAttribute(name);
+      }
+      link.href = source?.link.getAttribute('href') || '/c/' + id; link.draggable = false;
+      decorate({ id, wrapper: shell, shell, link }, dateFor({ id }));
+      if (!source && location.pathname === '/c/' + id) link.setAttribute('aria-current', 'page');
+      const focused = content.contains(document.activeElement); content.replaceChildren(shell);
+      if (focused) link.focus({ preventScroll: true });
+    }
+  }
+  function renderCollections(nav, list) {
+    const key = collectionKey();
+    if (!nav || !key) { collectionPanel?.remove(); collectionPanel = null; return; }
+    if (collectionDrag?.active && collectionPanel?.isConnected) return;
+    if (collectionEditor?.isConnected && collectionPanel?.isConnected) return;
+    let data, error;
+    try { data = readCollections(key); } catch (cause) { error = cause.message; }
+    const titles = data?.items.map(x => [x.id, records.get(x.id)?.title || x.title]);
+    const signature = JSON.stringify([key, data, titles, error]);
+    if (collectionPanel?.isConnected && signature === collectionSignature) return;
+    collectionSignature = signature; collectionPanel?.remove();
+    const panel = owned('section', 'collections'); panel.className = 'cst-collections'; collectionPanel = panel;
+    const nativeLink = nav.querySelector('[data-sidebar-cycle-item] a[href*="/c/"]');
+    if (nativeLink) panel.style.font = getComputedStyle(nativeLink).font;
+    panel.setAttribute('aria-label', '收藏分组');
+    const nativeHeading = nav.querySelector('[class~="group/nav-section-title"]');
+    const nativeToggle = nativeHeading?.querySelector('button[aria-expanded]');
+    const header = document.createElement('div'); header.className = (nativeHeading?.className || '') + ' cst-collection-heading';
+    if (nativeToggle) header.style.font = getComputedStyle(nativeToggle).font;
+    const label = collectionButton('', async () => {
+      try { await changeCollections(key, fresh => { fresh.collapsed = !fresh.collapsed; }); }
+      catch (cause) { collectionError('无法保存折叠状态：' + cause.message); }
+    });
+    label.className = (nativeToggle?.className || '') + ' cst-collection-toggle'; label.append(chevron(), document.createTextNode('收藏'));
+    label.setAttribute('aria-expanded', String(!data?.collapsed));
+    label.setAttribute('aria-label', data?.collapsed ? '展开全部收藏' : '折叠全部收藏'); label.disabled = !!error;
+    panel.dataset.collapsed = String(!!data?.collapsed);
+    const create = collectionIcon('新建收藏分组', 'M12 5v14M5 12h14', () => editCollections()); create.disabled = !!error;
+    create.setAttribute('aria-label', '新建收藏分组'); header.append(label, create); panel.append(header);
+    if (error) { const notice = document.createElement('p'); notice.setAttribute('role', 'alert'); notice.textContent = error; panel.append(notice); }
+    const groups = document.createElement('div'); groups.className = 'cst-collection-groups'; groups.hidden = !!data?.collapsed; panel.append(groups);
+    for (const group of data?.groups || []) {
+      const block = document.createElement('div'); block.className = 'cst-collection-group'; block.dataset.collectionId = group.id;
+      const heading = document.createElement('div'); heading.className = 'cst-group cst-collection-heading';
+      const entries = data.items.filter(x => x.groups.includes(group.id));
+      const toggle = collectionButton('', async () => {
+        try { await changeCollections(key, fresh => { const entry = fresh.groups.find(x => x.id === group.id); if (entry) entry.collapsed = !entry.collapsed; }); }
+        catch (cause) { collectionError('无法保存折叠状态：' + cause.message); }
+      });
+      toggle.className = 'cst-group-toggle'; toggle.setAttribute('aria-expanded', String(!group.collapsed));
+      const title = document.createElement('span'); title.textContent = group.name;
+      toggle.append(chevron(), title); toggle.setAttribute('aria-label', (group.collapsed ? '展开' : '折叠') + group.name);
+      const count = document.createElement('span'); count.textContent = String(entries.length); count.className = 'cst-group-count';
+      const edit = collectionIcon('编辑分组：' + group.name, 'm16 3 5 5-12 12H4v-5ZM14 5l5 5', event => editCollections(null, group, event.currentTarget));
+      heading.append(toggle, count, edit); block.append(heading);
+      const links = document.createElement('div'); links.setAttribute('role', 'list'); links.hidden = group.collapsed;
+      for (const entry of entries) {
+        const row = document.createElement('div'); row.className = 'cst-collection-row'; row.setAttribute('role', 'listitem');
+        row.dataset.conversationId = entry.id; row.dataset.title = records.get(entry.id)?.title || entry.title;
+        const content = document.createElement('div'); content.className = 'cst-collection-native';
+        const actions = document.createElement('div'); actions.className = 'cst-collection-row-actions';
+        const adjust = collectionIcon('调整收藏分组：' + row.dataset.title, 'M3 7V5h6l2 2h10v13H3ZM12 10v7M8.5 13.5h7', event => editCollections({ id: entry.id, title: row.dataset.title }, null, event.currentTarget));
+        const remove = collectionIcon('从' + group.name + '移除：' + row.dataset.title, 'M6 3h12v18l-6-4-6 4ZM9 9h6', async () => {
+          try { await changeCollections(key, fresh => {
+            const saved = fresh.items.find(x => x.id === entry.id);
+            if (saved) saved.groups = saved.groups.filter(id => id !== group.id);
+            fresh.items = fresh.items.filter(x => x.groups.length);
+          }); } catch (cause) { collectionError('无法移除收藏：' + cause.message); }
+        });
+        actions.append(adjust, remove); row.append(content, actions); links.append(row);
+        row.addEventListener('click', event => openCollectionChat(event, entry.id));
+        row.addEventListener('contextmenu', event => {
+          event.preventDefault(); event.stopPropagation(); editCollections({ id: entry.id, title: row.dataset.title }, null, row);
+        });
+      }
+      links.setAttribute('aria-label', group.name); if (!entries.length) heading.title = '拖入对话以收藏';
+      block.append(links); groups.append(block);
+    }
+    const section = list?.closest('[class~="group/nav-section"]');
+    if (section) section.before(panel); else nav.append(panel);
+  }
+  function rememberMenuTarget(event) {
+    if (!(event.target instanceof Element)) return;
+    const button = event.target.closest('button[aria-haspopup="menu"]');
+    const row = button?.closest('[data-sidebar-cycle-item],.sidebar-item,[data-testid^="history-item-"]');
+    const link = row?.querySelector('a[href*="/c/"]');
+    if (!link || !row.closest('nav,aside,#history')) return;
+    const id = conversationId(link.getAttribute('href'));
+    if (id) menuTarget = { button, key: collectionKey(), item: { id, title: (link.getAttribute('aria-label') || link.firstElementChild?.textContent || link.textContent).trim().slice(0, 300) || '未命名对话' } };
+    schedule();
+  }
+  function renderCollectionMenu() {
+    if (!menuTarget?.key || menuTarget.key !== collectionKey() || !menuTarget.button.isConnected || menuTarget.button.getAttribute('aria-expanded') !== 'true') return;
+    const menu = document.getElementById(menuTarget.button.getAttribute('aria-controls'));
+    if (!menu || menu.getAttribute('role') !== 'menu' || menu.querySelector('[data-cst-owned="collection-action"]')) return;
+    const target = menuTarget.item;
+    const action = collectionButton('收藏到分组…', event => {
+      event.preventDefault(); event.stopPropagation();
+      menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      editCollections(target);
+    });
+    action.dataset.cstOwned = 'collection-action'; action.setAttribute('role', 'menuitem');
+    const reference = menu.querySelector('[role="menuitem"]');
+    action.className = (reference?.className || '') + ' cst-collection-menu-action';
+    if (reference) {
+      const style = getComputedStyle(reference);
+      for (const property of ['font-family', 'font-size', 'font-weight', 'line-height', 'letter-spacing', 'padding', 'border-radius', 'height', 'box-sizing', 'display', 'align-items']) action.style.setProperty(property, style.getPropertyValue(property));
+    }
+    const content = document.createElement('span'); content.className = 'cst-collection-menu-content';
+    const icon = chevron(); icon.replaceChildren();
+    const path = document.createElementNS(icon.namespaceURI, 'path'); path.setAttribute('d', 'M6 3h12v18l-6-4-6 4Z'); icon.append(path);
+    const text = document.createElement('span'); text.textContent = action.textContent;
+    content.append(icon, text); action.replaceChildren(content);
+    menu.append(action);
+    menu.addEventListener('keydown', event => {
+      if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+      const entries = [...menu.querySelectorAll('[role="menuitem"]')].filter(node => !node.matches(':disabled,[aria-disabled="true"],[data-disabled]'));
+      const index = entries.indexOf(document.activeElement), last = entries.length - 1;
+      if (document.activeElement === action || (event.key === 'ArrowDown' && index === last - 1) || (event.key === 'ArrowUp' && index === 0)) {
+        event.preventDefault(); event.stopPropagation();
+        entries[(index + (event.key === 'ArrowDown' ? 1 : -1) + entries.length) % entries.length]?.focus();
+      }
+    }, true);
+  }
+  function cancelCollectionDrag() {
+    if (!collectionDrag) return;
+    const { link, draggable, ghost } = collectionDrag;
+    if (draggable === null) link.removeAttribute('draggable'); else link.setAttribute('draggable', draggable);
+    ghost?.remove(); collectionDrag = null;
+    for (const node of document.querySelectorAll('[data-cst-drop-active]')) node.removeAttribute('data-cst-drop-active');
+    schedule();
+  }
+  function startCollectionDrag(event) {
+    if (event.button !== 0 || event.pointerType !== 'mouse' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || !collectionKey() || !collectionPanel?.isConnected || collectionPanel.dataset.collapsed === 'true') return;
+    const link = event.target instanceof Element && event.target.closest('a[href*="/c/"]');
+    if (!link?.closest('nav,aside,#history') || !link.closest('[data-sidebar-cycle-item],.sidebar-item,[data-testid^="history-item-"],.cst-collection-row')) return;
+    const id = conversationId(link.getAttribute('href')); if (!id) return;
+    cancelCollectionDrag();
+    collectionDrag = { key: collectionKey(), link, draggable: link.getAttribute('draggable'), id,
+      title: (link.getAttribute('aria-label') || link.firstElementChild?.textContent || link.textContent).trim().slice(0, 300) || '未命名对话',
+      from: link.closest('[data-collection-id]')?.dataset.collectionId || null,
+      pointer: event.pointerId, x: event.clientX, y: event.clientY, active: false, target: null };
+    // Keep native click navigation, but reserve this drag for local collections instead of the host sorter.
+    link.draggable = false; event.stopPropagation();
+  }
+  function moveCollectionDrag(event) {
+    const drag = collectionDrag;
+    if (!drag || drag.pointer !== event.pointerId) return;
+    if (!drag.active && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 6) return;
+    if (!drag.active) {
+      drag.active = true; drag.ghost = owned('div', 'collection-drag'); drag.ghost.className = 'cst-collection-drag';
+      drag.ghost.textContent = drag.title; drag.ghost.style.font = getComputedStyle(drag.link).font;
+      document.body.append(drag.ghost);
+    }
+    event.preventDefault(); event.stopPropagation();
+    drag.ghost.style.left = event.clientX + 14 + 'px'; drag.ghost.style.top = event.clientY + 12 + 'px';
+    const block = document.elementFromPoint(event.clientX, event.clientY)?.closest('.cst-collections [data-collection-id]');
+    drag.target = block?.dataset.collectionId || null;
+    for (const node of document.querySelectorAll('[data-cst-drop-active]')) if (node !== block) node.removeAttribute('data-cst-drop-active');
+    if (block) block.setAttribute('data-cst-drop-active', 'true');
+  }
+  async function finishCollectionDrag(event) {
+    const drag = collectionDrag;
+    if (!drag || drag.pointer !== event.pointerId) return;
+    if (!drag.active) { cancelCollectionDrag(); return; }
+    event.preventDefault(); event.stopPropagation();
+    let common = drag.link;
+    const over = document.elementFromPoint(event.clientX, event.clientY);
+    while (common && !common.contains(over)) common = common.parentElement;
+    suppressCollectionClick = { link: drag.link, common, until: Date.now() + 300 };
+    const target = over?.closest('.cst-collections [data-collection-id]')?.dataset.collectionId;
+    cancelCollectionDrag();
+    if (!target) return;
+    try {
+      await changeCollections(drag.key, data => {
+        const group = data.groups.find(x => x.id === target);
+        if (!group) throw new Error('目标分组已变化，请重新拖入。');
+        let item = data.items.find(x => x.id === drag.id);
+        if (!item) { item = { id: drag.id, title: drag.title, groups: [] }; data.items.push(item); }
+        if (drag.from) item.groups = item.groups.filter(id => id !== drag.from);
+        item.groups = [...new Set([...item.groups, target])]; group.collapsed = false;
+      });
+    } catch (error) {
+      const status = owned('p', 'collection-drop-error'); status.setAttribute('role', 'alert'); status.textContent = '无法移动收藏：' + error.message;
+      collectionPanel?.append(status);
+    }
+  }
   function paint() {
     timer = null; updateScope();
     observer.disconnect();
@@ -337,7 +711,12 @@
       const nav = list?.closest('nav') || list?.closest('aside') || document.querySelector('nav a[href*="/c/"]')?.closest('nav');
       if (nav) attr(nav, 'data-cst-sidebar', '');
       if (list) {
-      const nativeRows = rows(list), dates = new Map(nativeRows.map(row => [row.id, dateFor(row)]));
+      let collected = new Set();
+      try { const key = collectionKey(); if (key) collected = new Set(readCollections(key).items.map(item => item.id)); }
+      catch { /* Invalid collection storage is shown by renderCollections; keep native rows visible. */ }
+      const allRows = rows(list);
+      for (const row of allRows) { attr(row.wrapper, 'data-cst-collected', collected.has(row.id)); decorate(row, dateFor(row)); }
+      const nativeRows = allRows.filter(row => !collected.has(row.id)), dates = new Map(nativeRows.map(row => [row.id, dateFor(row)]));
       const ready = nativeRows.some(row => !!dates.get(row.id));
       if (ready) {
         attr(list, 'data-cst-list', '');
@@ -347,7 +726,6 @@
         for (let i = 0; i < GROUPS.length; i++) group(list, i, counts[i]);
         for (const row of nativeRows) {
           const ms = dates.get(row.id), index = groupFor(ms);
-          decorate(row, ms);
           row.wrapper.style.setProperty('--cst-order', index * 1000000 + rank.get(row.id) + 1);
           attr(row.wrapper, 'data-cst-collapsed', collapsed[index]);
         }
@@ -355,29 +733,29 @@
         for (const header of list.querySelectorAll(':scope > [data-cst-owned="group"]')) header.remove();
         list.removeAttribute('data-cst-list');
         for (const row of nativeRows) {
-          decorate(row, null);
           row.wrapper.style.removeProperty('--cst-order'); row.wrapper.removeAttribute('data-cst-collapsed');
         }
       }
       }
       // Pinned timestamps also work when Recents is collapsed or absent.
       if (nav) for (const link of nav.querySelectorAll('a[href*="/c/"]')) {
-        if (list?.contains(link)) continue;
+        if (list?.contains(link) || link.closest('[data-cst-owned="collections"]')) continue;
         const id = conversationId(link.getAttribute('href'));
         const shell = link.closest('[data-sidebar-cycle-item], .sidebar-item, [data-testid^="history-item-"]') || link;
         if (id && shell) { const row = { id, link, shell, wrapper: shell }; decorate(row, dateFor(row)); }
       }
+      renderCollections(nav, list); renderCollectionRows(nav); renderCollectionMenu();
     } finally { observe(); }
   }
   const observer = new MutationObserver(mutations => {
     const relevant = mutations.some(m => {
       const node = m.target.nodeType === 1 ? m.target : m.target.parentElement;
       return !node?.closest('[data-cst-owned]') && (node?.closest('aside, nav, #history') ||
-        [...m.addedNodes].some(n => n.nodeType === 1 && (n.matches('aside,nav,#history') || n.querySelector('aside,nav,#history'))));
+        [...m.addedNodes].some(n => n.nodeType === 1 && (n.matches('aside,nav,#history,[role="menu"]') || n.querySelector('aside,nav,#history,[role="menu"]'))));
     });
     if (relevant) schedule();
   });
-  function observe() { observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['href', 'aria-label', 'aria-expanded', 'datetime'] }); }
+  function observe() { observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['href', 'aria-label', 'aria-expanded', 'datetime', 'class', 'aria-current', 'aria-busy', 'data-state'] }); }
   function openRowMenu(event) {
     if (event.defaultPrevented || !(event.target instanceof Element)) return;
     const target = event.target;
@@ -404,6 +782,7 @@
       '[data-cst-list]{display:flex!important;flex-direction:column!important}',
       '[data-cst-list]>*{order:var(--cst-order,5000000)}',
       '[data-cst-list]>[data-cst-collapsed="true"],[data-cst-list]>[data-cst-owned="group"][hidden]{display:none!important}',
+      '[data-cst-collected="true"]{display:none!important}',
       '[data-cst-shell]{position:relative}',
       '[data-cst-shell],[data-cst-sidebar] :is([data-sidebar-cycle-item],.sidebar-item):is([href*="/c/"],:has(a[href*="/c/"])){min-height:32px!important;height:32px!important}',
       '[data-cst-link]{display:flex!important;flex:1 1 0%!important;flex-direction:row!important;align-items:center!important;align-self:stretch;gap:10px;min-width:0!important;overflow:hidden}',
@@ -416,11 +795,70 @@
       '.cst-group-toggle[aria-expanded="true"] svg{transform:rotate(90deg)}',
       '.cst-group-toggle:focus-visible{outline:2px solid var(--text-primary,currentColor);outline-offset:2px;border-radius:4px}',
       '.cst-group-count{margin-inline-start:auto;font-size:11px;font-variant-numeric:tabular-nums}',
+      '.cst-collections{margin:12px 0;color:var(--text-primary,inherit);font:inherit}',
+      '.cst-collection-heading{display:flex;align-items:center;gap:7px;color:var(--cst-muted);box-sizing:border-box}',
+      '.cst-collection-heading:not(.cst-group):not([class~="group/nav-section-title"]){min-height:30px;padding:5px 8px}',
+      '.cst-collections button,.cst-collection-editor button,.cst-collection-menu-action{color:inherit;cursor:pointer}',
+      '.cst-collection-toggle{border:0;background:transparent;padding:0;border-radius:6px;font:inherit;color:inherit}',
+      '.cst-collection-icon{display:inline-flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px}',
+      '.cst-collection-icon:not([data-size]){border:0;background:transparent;padding:4px;border-radius:6px}',
+      '.cst-collection-icon svg{width:16px;height:16px;flex:none}',
+      '.cst-collection-toggle{display:flex;align-items:center;gap:6px;flex:1;min-width:0;text-align:start}',
+      '.cst-collection-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.cst-collection-toggle svg{width:12px;height:12px;flex:none}',
+      '.cst-collection-toggle[aria-expanded="true"] svg{transform:rotate(90deg)}',
+      '.cst-collection-row{position:relative;display:flex;align-items:center;min-height:32px}',
+      '.cst-collection-native{flex:1;min-width:0}',
+      '.cst-collection-native>:first-child{width:100%;box-sizing:border-box}',
+      '.cst-collections p{margin:4px 9px 8px;color:var(--cst-muted);font-size:12px;line-height:1.5}',
+      '.cst-collections [hidden]{display:none!important}',
+      '.cst-collections button:not([data-size]):hover{background:var(--sidebar-surface-secondary,rgba(128,128,128,.12))}',
+      '.cst-collection-row-actions{position:absolute;z-index:20;inset-inline-end:6px;display:flex;gap:2px;align-items:center;opacity:0;pointer-events:none;background:var(--sidebar-surface-primary,transparent)}',
+      '.cst-collection-row:is(:hover,:focus-within)>.cst-collection-row-actions{opacity:1;pointer-events:auto}',
+      '.cst-collection-row:is(:hover,:focus-within) [data-cst-link]{padding-inline-end:52px}',
+      '.cst-collection-menu-action{display:flex;width:100%;border:0;background:transparent;padding:6px 10px;text-align:start;border-radius:12px;color:inherit}',
+      '.cst-collection-menu-content{display:flex;align-items:center;gap:var(--spacing-menu-item-content,6px);width:100%;min-width:0}',
+      '.cst-collection-menu-content svg{width:20px;height:20px;flex:none}',
+      '.cst-collection-menu-content>span{flex:1;min-width:0;white-space:nowrap}',
+      '.cst-collection-menu-action:is(:hover,:focus-visible){background:rgba(128,128,128,.15)}',
+      '.cst-collection-editor{margin:4px 8px 8px 26px;min-width:0;color:inherit;font:inherit}',
+      '[data-cst-drop-active="true"]{background:var(--sidebar-surface-secondary,rgba(128,128,128,.12));outline:1px solid var(--border-medium,#8a8a92);border-radius:8px}',
+      '.cst-collection-drag{position:fixed;z-index:2147483647;pointer-events:none;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:7px 10px;border:1px solid var(--border-medium,#8a8a92);border-radius:8px;background:var(--main-surface-primary,#fff);color:var(--text-primary,#202123);box-shadow:0 5px 16px #0002}',
+      ':is(.dark,[data-theme="dark"]) .cst-collection-drag{background:var(--main-surface-primary,#212121);color:var(--text-primary,#ececf1)}',
+      '.cst-collection-input-row{display:flex;align-items:center;gap:4px;min-width:0}',
+      '.cst-collection-input-row>label{flex:1;min-width:0}',
+      '.cst-collection-editor input[type="text"]{box-sizing:border-box;width:100%;min-width:0;padding:5px 7px;border:1px solid var(--border-medium,#8a8a92);border-radius:6px;color:inherit;background:transparent;font:inherit}',
+      '.cst-collection-choices{padding:0;border:0;min-width:0;max-height:240px;overflow:auto}',
+      '.cst-collection-choices legend{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:8px;color:inherit}',
+      '.cst-collection-choices label{display:flex;gap:6px;min-height:28px;align-items:center;overflow-wrap:anywhere}',
+      '.cst-collection-choices input{width:16px;height:16px;flex:none;accent-color:var(--text-primary,#34343a)}',
+      '.cst-collection-actions{display:flex;gap:2px;flex:none}',
+      '.cst-collection-editor .cst-collection-delete{color:#b42318}',
+      ':is(.dark,[data-theme="dark"]) .cst-collection-editor .cst-collection-delete{color:#ff9a91}',
+      '.cst-collection-error{font-size:12px;line-height:1.5;color:inherit;overflow-wrap:anywhere}',
+      '.cst-collection-error:empty{display:none}',
+      '.cst-collection-icon:not([data-size]):focus-visible,.cst-collection-toggle:focus-visible{outline:2px solid currentColor;outline-offset:2px}',
+      '.cst-collections button:disabled,.cst-collection-editor button:disabled{opacity:.5;cursor:default}',
+      '@media(pointer:coarse){.cst-collection-row-actions{opacity:1;pointer-events:auto}.cst-collection-row [data-cst-link]{padding-inline-end:52px}.cst-collection-row{min-height:36px}.cst-collection-editor input[type="text"]{font-size:16px}}',
       '@media(pointer:coarse){[data-cst-shell],[data-cst-sidebar] :is([data-sidebar-cycle-item],.sidebar-item):is([href*="/c/"],:has(a[href*="/c/"])){min-height:36px!important;height:36px!important}}',
     ].join('\n');
     (document.head || document.documentElement).append(style);
     observe(); schedule();
     document.addEventListener('contextmenu', openRowMenu);
+    document.addEventListener('pointerdown', rememberMenuTarget, true);
+    document.addEventListener('click', rememberMenuTarget, true);
+    document.addEventListener('pointerdown', startCollectionDrag, true);
+    document.addEventListener('pointermove', moveCollectionDrag, true);
+    document.addEventListener('pointerup', finishCollectionDrag, true);
+    document.addEventListener('pointercancel', cancelCollectionDrag, true);
+    document.addEventListener('keydown', event => { if (event.key === 'Escape' && collectionDrag) { event.preventDefault(); cancelCollectionDrag(); } }, true);
+    document.addEventListener('click', event => {
+      const suppressed = suppressCollectionClick;
+      if (suppressed && Date.now() <= suppressed.until && (suppressed.link.contains(event.target) || suppressed.common === event.target)) {
+        event.preventDefault(); event.stopImmediatePropagation(); suppressCollectionClick = null;
+      }
+    }, true);
+    window.addEventListener('storage', event => { if (event.key === collectionKey()) { collectionSignature = ''; schedule(); } });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) schedule(); });
     // Local clock display only. No network work is scheduled here or anywhere in this script.
     setInterval(() => { if (!document.hidden) schedule(); }, 30000);
