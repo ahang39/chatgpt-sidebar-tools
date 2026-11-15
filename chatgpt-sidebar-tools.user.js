@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 原生侧边栏助手
 // @namespace    local.chatgpt.sidebar-tools
-// @version      2.7.1
+// @version      2.7.7
 // @description  原生对话时间、日期分组、本地收藏分组与右键菜单；不主动发起任何网络请求。
 // @author       ahang39
 // @homepageURL  https://github.com/ahang39/chatgpt-sidebar-tools
@@ -280,12 +280,30 @@
   function owned(tag, kind) {
     const node = document.createElement(tag); node.dataset.cstOwned = kind; return node;
   }
-  function findList() {
-    for (const section of document.querySelectorAll('nav [class~="group/nav-section"]')) {
-      const heading = section.firstElementChild;
-      if (!heading?.classList.contains('group/nav-section-title')) continue;
-      if (!/^(最近|近期|聊天|聊天记录|Recent|Recents|Chats|Your chats|Chat history|History)$/i.test(heading.querySelector('button[aria-expanded]')?.textContent.trim() || '')) continue;
-      const list = section.querySelector('[role="list"]');
+  const SECTION = '[class~="group/nav-section"]';
+  const RECENTS_SECTION = '[data-app-action-sidebar-section-heading="Recents"]';
+  function sectionToggle(section) {
+    const heading = section.firstElementChild;
+    return heading?.querySelector('button[data-app-action-sidebar-section-toggle]')
+      || heading?.querySelector('button[aria-expanded]');
+  }
+  function findRecentsSection() {
+    const native = document.querySelector('nav ' + RECENTS_SECTION);
+    const inner = native?.querySelector(':scope > ' + SECTION + ':not([data-cst-owned])');
+    if (inner && sectionToggle(inner)) return inner;
+    for (const section of document.querySelectorAll('nav ' + SECTION)) {
+      if (section.closest('[data-cst-owned]')) continue;
+      const toggle = sectionToggle(section);
+      const title = toggle?.querySelector('span')?.textContent || toggle?.textContent || '';
+      if (/^(最近|近期|聊天|聊天记录|Recent|Recents|Chats|Your chats|Chat history|History)$/i.test(title.trim())) return section;
+    }
+    return null;
+  }
+  function findList(section) {
+    if (section) {
+      const nativeLists = [...section.querySelectorAll('[class~="group/nav-list"], [role="list"], ol, ul')]
+        .filter(node => node.closest(SECTION) === section && !node.closest('[data-cst-owned]'));
+      const list = nativeLists.find(node => node.matches('[role="list"], ol, ul')) || nativeLists[0];
       if (list) return list;
     }
     const history = document.querySelector('nav #history, aside #history, #history');
@@ -335,21 +353,60 @@
     const path = document.createElementNS(svg.namespaceURI, 'path'); path.setAttribute('d', 'm9 18 6-6-6-6'); svg.append(path);
     return svg;
   }
-  function group(list, index, count) {
+  function mountDisclosure(header, button, title, reference, ...actions) {
+    const heading = reference?.closest('[class~="group/nav-section-title"]');
+    const nativeHeader = heading && (reference.parentElement !== heading || heading.classList.contains('flex')) ? heading : null;
+    const label = document.createElement('span');
+    const nativeLabel = reference?.querySelector('span');
+    if (nativeLabel) label.className = nativeLabel.className;
+    label.textContent = title;
+
+    const nativeIcon = reference?.querySelector('svg.icon-disclosure');
+    const icon = nativeIcon?.cloneNode(true) || chevron();
+    if (nativeIcon) {
+      for (const name of [...icon.classList]) if (name.startsWith('rotate-')) icon.classList.remove(name);
+      icon.classList.add('cst-native-disclosure');
+    } else {
+      icon.classList.add('cst-fallback-disclosure');
+    }
+    button.className = 'cst-group-toggle';
+    if (reference?.className) button.className += ' ' + reference.className;
+    if (reference?.style.font) button.style.font = reference.style.font;
+    if (reference?.style.color) button.style.color = reference.style.color;
+    button.append(label, icon);
+
+    let branch = button;
+    if (nativeHeader) {
+      header.classList.add('cst-native-heading', ...nativeHeader.classList);
+      for (let parent = reference.parentElement; parent !== nativeHeader; parent = parent.parentElement) {
+        const wrapper = document.createElement('div');
+        wrapper.className = parent.className;
+        wrapper.append(branch);
+        branch = wrapper;
+      }
+    }
+    header.append(branch);
+    if (actions.length) {
+      const rail = document.createElement('div');
+      const nativeRail = nativeHeader?.lastElementChild;
+      rail.className = nativeRail && !nativeRail.contains(reference) ? nativeRail.className : 'cst-heading-actions';
+      rail.append(...actions);
+      header.append(rail);
+    }
+  }
+  function group(list, index, count, reference) {
     let header = list.querySelector(':scope > [data-cst-owned="group"][data-group="' + index + '"]');
     if (!header) {
       header = owned(/^(UL|OL)$/.test(list.tagName) ? 'li' : 'div', 'group');
       header.className = 'cst-group'; header.dataset.group = index; header.setAttribute('role', 'listitem');
       const toggle = document.createElement('button'); toggle.type = 'button'; toggle.className = 'cst-group-toggle';
-      const label = document.createElement('span'); label.textContent = GROUPS[index];
-      toggle.append(chevron(), label);
       toggle.addEventListener('click', () => {
         collapsed[index] = !collapsed[index];
         try { localStorage.setItem(PREF_KEY, JSON.stringify({ collapsed })); } catch { /* The current page still remembers. */ }
         schedule();
       });
       const counter = document.createElement('span'); counter.className = 'cst-group-count';
-      header.append(toggle, counter); list.append(header);
+      mountDisclosure(header, toggle, GROUPS[index], reference, counter); list.append(header);
     }
     header.hidden = count === 0; header.style.setProperty('--cst-order', index * 1000000);
     const toggle = header.querySelector('button');
@@ -379,11 +436,20 @@
   }
   function collectionIcon(label, path, action) {
     const button = collectionButton('', action);
-    const reference = document.querySelector('nav button[aria-haspopup="menu"]');
+    const section = findRecentsSection();
+    const reference = section?.firstElementChild?.querySelector('button[data-size]:not([aria-haspopup])')
+      || document.querySelector('nav button[aria-haspopup="menu"]');
     button.className = (reference?.className || '') + ' cst-collection-icon';
     for (const name of ['data-color', 'data-variant', 'data-uniform', 'data-size']) if (reference?.hasAttribute(name)) button.setAttribute(name, reference.getAttribute(name));
     button.setAttribute('aria-label', label); button.title = label;
-    const svg = chevron(); svg.firstElementChild.setAttribute('d', path); button.append(svg);
+    const svg = chevron(); svg.firstElementChild.setAttribute('d', path);
+    const inner = reference?.firstElementChild;
+    if (inner?.tagName === 'SPAN') {
+      const wrapper = document.createElement('span');
+      wrapper.className = inner.className;
+      wrapper.append(svg);
+      button.append(wrapper);
+    } else button.append(svg);
     return button;
   }
   function closeCollectionEditor() {
@@ -500,32 +566,48 @@
     const sources = nativeCollectionRows(nav), template = [...sources.values()].find(row => !row.link.hasAttribute('aria-current')) || sources.values().next().value;
     for (const row of collectionPanel.querySelectorAll('.cst-collection-row')) {
       const id = row.dataset.conversationId, source = sources.get(id), content = row.querySelector('.cst-collection-native');
-      const signature = source ? source.shell.outerHTML : JSON.stringify([template?.shell.className, records.get(id)?.title || row.dataset.title, dateFor({ id }), relativeTime(dateFor({ id })), location.pathname]);
-      if (collectionRowSignatures.get(row) === signature) continue;
-      collectionRowSignatures.set(row, signature);
+      const ms = dateFor({ id });
+      const title = records.get(id)?.title || row.dataset.title;
+      const sourceMarkup = source ? source.shell.outerHTML : JSON.stringify([template?.shell.className, template?.link.className, title, location.pathname]);
+      const previous = collectionRowSignatures.get(row);
+      if (previous?.sourceMarkup === sourceMarkup) {
+        decorate(previous, ms);
+        continue;
+      }
       let shell, link;
       if (source) {
         shell = source.shell.cloneNode(true);
         // Keep the native title and status rail, but local collection actions have their own handlers.
-        for (const node of shell.querySelectorAll('[data-hover-card-open-immediately],button')) node.remove();
+        for (const node of shell.querySelectorAll('[data-hover-card-open-immediately],button,[data-cst-owned="time"]')) node.remove();
         link = shell.matches('a') ? shell : shell.querySelector('a[href*="/c/"]');
       } else {
         shell = document.createElement('div'); shell.className = template?.shell.className || '';
         link = document.createElement('a'); link.className = template?.link.className || '';
-        const title = template?.link.querySelector('[data-thread-title],.native-title')?.cloneNode(false) || document.createElement('span');
-        title.textContent = records.get(id)?.title || row.dataset.title; link.append(title); shell.append(link);
+        const titleNode = template?.link.querySelector('[data-thread-title],.native-title')?.cloneNode(false) || document.createElement('span');
+        titleNode.textContent = title; link.append(titleNode); shell.append(link);
       }
       for (const node of [shell, ...shell.querySelectorAll('*')]) {
-        for (const name of ['id', 'aria-controls', 'aria-describedby', 'aria-labelledby', 'data-sidebar-cycle-item', 'data-testid', 'data-cst-collected', 'data-cst-collapsed']) node.removeAttribute(name);
+        for (const name of ['id', 'aria-controls', 'aria-describedby', 'aria-labelledby', 'data-sidebar-cycle-item', 'data-testid', 'data-cst-collected', 'data-cst-collapsed', 'data-cst-row', 'data-cst-link', 'data-cst-shell']) node.removeAttribute(name);
       }
       link.href = source?.link.getAttribute('href') || '/c/' + id; link.draggable = false;
-      decorate({ id, wrapper: shell, shell, link }, dateFor({ id }));
+      link.style.removeProperty('--cst-recency-color');
+      link.style.removeProperty('--cst-recency-weight');
       if (!source && location.pathname === '/c/' + id) link.setAttribute('aria-current', 'page');
+      // Ignore native menu changes and local clock updates that do not change the visible row.
+      const markup = shell.outerHTML;
+      if (previous?.markup === markup) {
+        previous.sourceMarkup = sourceMarkup;
+        decorate(previous, ms);
+        continue;
+      }
+      const mirror = { id, wrapper: shell, shell, link, sourceMarkup, markup };
+      collectionRowSignatures.set(row, mirror);
+      decorate(mirror, ms);
       const focused = content.contains(document.activeElement); content.replaceChildren(shell);
       if (focused) link.focus({ preventScroll: true });
     }
   }
-  function renderCollections(nav, list) {
+  function renderCollections(nav, section, reference) {
     const key = collectionKey();
     if (!nav || !key) { collectionPanel?.remove(); collectionPanel = null; return; }
     if (collectionDrag?.active && collectionPanel?.isConnected) return;
@@ -534,26 +616,28 @@
     try { data = readCollections(key); } catch (cause) { error = cause.message; }
     const titles = data?.items.map(x => [x.id, records.get(x.id)?.title || x.title]);
     const signature = JSON.stringify([key, data, titles, error]);
-    if (collectionPanel?.isConnected && signature === collectionSignature) return;
+    // Keep the panel outside ChatGPT's collapsible section.
+    const nativeSection = section?.closest(RECENTS_SECTION);
+    const anchor = nativeSection || section;
+    const mount = anchor?.parentElement || nav;
+    if (collectionPanel?.parentElement === mount && signature === collectionSignature) return;
     collectionSignature = signature; collectionPanel?.remove();
     const panel = owned('section', 'collections'); panel.className = 'cst-collections'; collectionPanel = panel;
     const nativeLink = nav.querySelector('[data-sidebar-cycle-item] a[href*="/c/"]');
     if (nativeLink) panel.style.font = getComputedStyle(nativeLink).font;
+    panel.classList.add('group/nav-section');
+    if (nativeSection && nativeSection !== section) panel.classList.add(...nativeSection.classList);
     panel.setAttribute('aria-label', '收藏分组');
-    const nativeHeading = nav.querySelector('[class~="group/nav-section-title"]');
-    const nativeToggle = nativeHeading?.querySelector('button[aria-expanded]');
-    const header = document.createElement('div'); header.className = (nativeHeading?.className || '') + ' cst-collection-heading';
-    if (nativeToggle) header.style.font = getComputedStyle(nativeToggle).font;
+    const header = document.createElement('div'); header.className = 'cst-group cst-collection-heading';
     const label = collectionButton('', async () => {
       try { await changeCollections(key, fresh => { fresh.collapsed = !fresh.collapsed; }); }
       catch (cause) { collectionError('无法保存折叠状态：' + cause.message); }
     });
-    label.className = (nativeToggle?.className || '') + ' cst-collection-toggle'; label.append(chevron(), document.createTextNode('收藏'));
     label.setAttribute('aria-expanded', String(!data?.collapsed));
     label.setAttribute('aria-label', data?.collapsed ? '展开全部收藏' : '折叠全部收藏'); label.disabled = !!error;
     panel.dataset.collapsed = String(!!data?.collapsed);
     const create = collectionIcon('新建收藏分组', 'M12 5v14M5 12h14', () => editCollections()); create.disabled = !!error;
-    create.setAttribute('aria-label', '新建收藏分组'); header.append(label, create); panel.append(header);
+    create.setAttribute('aria-label', '新建收藏分组'); mountDisclosure(header, label, '收藏', reference, create); panel.append(header);
     if (error) { const notice = document.createElement('p'); notice.setAttribute('role', 'alert'); notice.textContent = error; panel.append(notice); }
     const groups = document.createElement('div'); groups.className = 'cst-collection-groups'; groups.hidden = !!data?.collapsed; panel.append(groups);
     for (const group of data?.groups || []) {
@@ -565,11 +649,10 @@
         catch (cause) { collectionError('无法保存折叠状态：' + cause.message); }
       });
       toggle.className = 'cst-group-toggle'; toggle.setAttribute('aria-expanded', String(!group.collapsed));
-      const title = document.createElement('span'); title.textContent = group.name;
-      toggle.append(chevron(), title); toggle.setAttribute('aria-label', (group.collapsed ? '展开' : '折叠') + group.name);
+      toggle.setAttribute('aria-label', (group.collapsed ? '展开' : '折叠') + group.name);
       const count = document.createElement('span'); count.textContent = String(entries.length); count.className = 'cst-group-count';
       const edit = collectionIcon('编辑分组：' + group.name, 'm16 3 5 5-12 12H4v-5ZM14 5l5 5', event => editCollections(null, group, event.currentTarget));
-      heading.append(toggle, count, edit); block.append(heading);
+      mountDisclosure(heading, toggle, group.name, reference, count, edit); block.append(heading);
       const links = document.createElement('div'); links.setAttribute('role', 'list'); links.hidden = group.collapsed;
       for (const entry of entries) {
         const row = document.createElement('div'); row.className = 'cst-collection-row'; row.setAttribute('role', 'listitem');
@@ -593,8 +676,7 @@
       links.setAttribute('aria-label', group.name); if (!entries.length) heading.title = '拖入对话以收藏';
       block.append(links); groups.append(block);
     }
-    const section = list?.closest('[class~="group/nav-section"]');
-    if (section) section.before(panel); else nav.append(panel);
+    if (anchor) anchor.before(panel); else nav.append(panel);
   }
   function rememberMenuTarget(event) {
     if (!(event.target instanceof Element)) return;
@@ -641,22 +723,26 @@
   }
   function cancelCollectionDrag() {
     if (!collectionDrag) return;
-    const { link, draggable, ghost } = collectionDrag;
+    const { link, draggable, ghost, revealedGroups } = collectionDrag;
     if (draggable === null) link.removeAttribute('draggable'); else link.setAttribute('draggable', draggable);
+    if (revealedGroups) revealedGroups.hidden = true;
     ghost?.remove(); collectionDrag = null;
     for (const node of document.querySelectorAll('[data-cst-drop-active]')) node.removeAttribute('data-cst-drop-active');
     schedule();
   }
   function startCollectionDrag(event) {
-    if (event.button !== 0 || event.pointerType !== 'mouse' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || !collectionKey() || !collectionPanel?.isConnected || collectionPanel.dataset.collapsed === 'true') return;
-    const link = event.target instanceof Element && event.target.closest('a[href*="/c/"]');
-    if (!link?.closest('nav,aside,#history') || !link.closest('[data-sidebar-cycle-item],.sidebar-item,[data-testid^="history-item-"],.cst-collection-row')) return;
+    if (event.button !== 0 || event.pointerType !== 'mouse' || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || !collectionKey() || !collectionPanel?.isConnected) return;
+    if (!(event.target instanceof Element) || event.target.closest('button,[role="button"],input,textarea,select,[contenteditable]:not([contenteditable="false"]),[role="menu"]')) return;
+    const row = event.target.closest('[data-sidebar-cycle-item],.sidebar-item,[data-testid^="history-item-"],[data-cst-shell],.cst-collection-row');
+    if (!row?.closest('nav,aside,#history')) return;
+    const link = row.matches('a[href*="/c/"]') ? row : row.querySelector('a[href*="/c/"]');
+    if (!link) return;
     const id = conversationId(link.getAttribute('href')); if (!id) return;
     cancelCollectionDrag();
     collectionDrag = { key: collectionKey(), link, draggable: link.getAttribute('draggable'), id,
       title: (link.getAttribute('aria-label') || link.firstElementChild?.textContent || link.textContent).trim().slice(0, 300) || '未命名对话',
-      from: link.closest('[data-collection-id]')?.dataset.collectionId || null,
-      pointer: event.pointerId, x: event.clientX, y: event.clientY, active: false, target: null };
+      row, from: link.closest('[data-collection-id]')?.dataset.collectionId || null,
+      pointer: event.pointerId, x: event.clientX, y: event.clientY, active: false };
     // Keep native click navigation, but reserve this drag for local collections instead of the host sorter.
     link.draggable = false; event.stopPropagation();
   }
@@ -671,8 +757,13 @@
     }
     event.preventDefault(); event.stopPropagation();
     drag.ghost.style.left = event.clientX + 14 + 'px'; drag.ghost.style.top = event.clientY + 12 + 'px';
-    const block = document.elementFromPoint(event.clientX, event.clientY)?.closest('.cst-collections [data-collection-id]');
-    drag.target = block?.dataset.collectionId || null;
+    const over = document.elementFromPoint(event.clientX, event.clientY);
+    if (collectionPanel?.dataset.collapsed === 'true' && !drag.revealedGroups &&
+        over?.closest('.cst-collections > .cst-collection-heading')) {
+      drag.revealedGroups = collectionPanel.querySelector('.cst-collection-groups');
+      drag.revealedGroups.hidden = false;
+    }
+    const block = over?.closest('.cst-collections [data-collection-id]');
     for (const node of document.querySelectorAll('[data-cst-drop-active]')) if (node !== block) node.removeAttribute('data-cst-drop-active');
     if (block) block.setAttribute('data-cst-drop-active', 'true');
   }
@@ -681,10 +772,10 @@
     if (!drag || drag.pointer !== event.pointerId) return;
     if (!drag.active) { cancelCollectionDrag(); return; }
     event.preventDefault(); event.stopPropagation();
-    let common = drag.link;
+    let common = drag.row;
     const over = document.elementFromPoint(event.clientX, event.clientY);
     while (common && !common.contains(over)) common = common.parentElement;
-    suppressCollectionClick = { link: drag.link, common, until: Date.now() + 300 };
+    suppressCollectionClick = { row: drag.row, common, until: Date.now() + 300 };
     const target = over?.closest('.cst-collections [data-collection-id]')?.dataset.collectionId;
     cancelCollectionDrag();
     if (!target) return;
@@ -696,6 +787,7 @@
         if (!item) { item = { id: drag.id, title: drag.title, groups: [] }; data.items.push(item); }
         if (drag.from) item.groups = item.groups.filter(id => id !== drag.from);
         item.groups = [...new Set([...item.groups, target])]; group.collapsed = false;
+        if (drag.revealedGroups) data.collapsed = false;
       });
     } catch (error) {
       const status = owned('p', 'collection-drop-error'); status.setAttribute('role', 'alert'); status.textContent = '无法移动收藏：' + error.message;
@@ -706,9 +798,11 @@
     timer = null; updateScope();
     observer.disconnect();
     try {
-      const list = findList();
+      const section = findRecentsSection();
+      const list = findList(section);
       if (list !== currentList) { clear(); currentList = list; }
-      const nav = list?.closest('nav') || list?.closest('aside') || document.querySelector('nav a[href*="/c/"]')?.closest('nav');
+      const nav = section?.closest('nav') || list?.closest('nav') || list?.closest('aside') || document.querySelector('nav a[href*="/c/"]')?.closest('nav');
+      const reference = section && sectionToggle(section);
       if (nav) attr(nav, 'data-cst-sidebar', '');
       if (list) {
       let collected = new Set();
@@ -723,7 +817,7 @@
         const ordered = sorted(nativeRows.map(row => ({ id: row.id, updated: dates.get(row.id), archived: false })));
         const rank = new Map(ordered.map((item, i) => [item.id, i]));
         const counts = GROUPS.map((_, i) => nativeRows.filter(row => groupFor(dates.get(row.id)) === i).length);
-        for (let i = 0; i < GROUPS.length; i++) group(list, i, counts[i]);
+        for (let i = 0; i < GROUPS.length; i++) group(list, i, counts[i], reference);
         for (const row of nativeRows) {
           const ms = dates.get(row.id), index = groupFor(ms);
           row.wrapper.style.setProperty('--cst-order', index * 1000000 + rank.get(row.id) + 1);
@@ -744,7 +838,7 @@
         const shell = link.closest('[data-sidebar-cycle-item], .sidebar-item, [data-testid^="history-item-"]') || link;
         if (id && shell) { const row = { id, link, shell, wrapper: shell }; decorate(row, dateFor(row)); }
       }
-      renderCollections(nav, list); renderCollectionRows(nav); renderCollectionMenu();
+      renderCollections(nav, section, reference); renderCollectionRows(nav); renderCollectionMenu();
     } finally { observe(); }
   }
   const observer = new MutationObserver(mutations => {
@@ -784,30 +878,26 @@
       '[data-cst-list]>[data-cst-collapsed="true"],[data-cst-list]>[data-cst-owned="group"][hidden]{display:none!important}',
       '[data-cst-collected="true"]{display:none!important}',
       '[data-cst-shell]{position:relative}',
-      '[data-cst-shell],[data-cst-sidebar] :is([data-sidebar-cycle-item],.sidebar-item):is([href*="/c/"],:has(a[href*="/c/"])){min-height:32px!important;height:32px!important}',
+      '[data-cst-shell],[data-cst-sidebar] :is([data-sidebar-cycle-item],.sidebar-item):is([href*="/c/"],:has(a[href*="/c/"])){min-height:30px!important;height:30px!important}',
       '[data-cst-link]{display:flex!important;flex:1 1 0%!important;flex-direction:row!important;align-items:center!important;align-self:stretch;gap:10px;min-width:0!important;overflow:hidden}',
       '[data-cst-shell]:is(:hover,:focus-within,[aria-current="page"]) [data-cst-link]>.cst-time,[data-cst-link][aria-current="page"]>.cst-time{color:var(--cst-tone-0)!important}',
       '[data-cst-link]>:not(.cst-time){order:0!important;flex:1 1 0%!important;min-width:0!important;overflow:hidden!important;text-overflow:ellipsis;white-space:nowrap}',
       '[data-cst-link]>.cst-time{order:1!important;flex:0 0 auto!important;margin-inline-start:auto;text-align:end;color:var(--cst-recency-color,var(--cst-muted));font-size:11px;font-weight:var(--cst-recency-weight,400);line-height:20px;font-variant-numeric:tabular-nums;white-space:nowrap}',
-      '.cst-group{display:flex;align-items:center;gap:7px;min-height:28px;margin-top:6px;padding:0 9px;color:var(--cst-muted);font:inherit;font-size:12px}',
-      '.cst-group-toggle{display:flex;align-items:center;gap:6px;flex:1;min-width:0;min-height:28px;padding:4px 0;border:0;background:transparent;color:inherit;font:inherit;font-weight:500;text-align:start;cursor:pointer}',
-      '.cst-group-toggle svg{width:12px;height:12px;flex:none}',
-      '.cst-group-toggle[aria-expanded="true"] svg{transform:rotate(90deg)}',
-      '.cst-group-toggle:focus-visible{outline:2px solid var(--text-primary,currentColor);outline-offset:2px;border-radius:4px}',
+      '.cst-group:not(.cst-native-heading){display:flex;align-items:center;gap:7px;min-height:28px;padding:0 9px;color:var(--cst-muted);box-sizing:border-box}',
+      '.cst-group:not(.cst-native-heading) .cst-group-toggle{display:flex;align-items:center;gap:4px;flex:1;min-width:0;min-height:28px;padding:2px 0;border:0;border-radius:6px;background:transparent;color:inherit;font:inherit;font-weight:500;text-align:start;cursor:pointer}',
+      '.cst-heading-actions{display:flex;align-items:center;gap:4px}',
+      '.cst-group-toggle[aria-expanded="false"] .cst-native-disclosure{rotate:-90deg}',
+      '.cst-group-toggle .cst-fallback-disclosure{width:12px;height:12px;flex:none}',
+      '.cst-group-toggle[aria-expanded="true"] .cst-fallback-disclosure{transform:rotate(90deg)}',
+      '.cst-group:not(.cst-native-heading) .cst-group-toggle:focus-visible{outline:2px solid var(--text-primary,currentColor);outline-offset:2px}',
       '.cst-group-count{margin-inline-start:auto;font-size:11px;font-variant-numeric:tabular-nums}',
-      '.cst-collections{margin:12px 0;color:var(--text-primary,inherit);font:inherit}',
-      '.cst-collection-heading{display:flex;align-items:center;gap:7px;color:var(--cst-muted);box-sizing:border-box}',
-      '.cst-collection-heading:not(.cst-group):not([class~="group/nav-section-title"]){min-height:30px;padding:5px 8px}',
-      '.cst-collections button,.cst-collection-editor button,.cst-collection-menu-action{color:inherit;cursor:pointer}',
-      '.cst-collection-toggle{border:0;background:transparent;padding:0;border-radius:6px;font:inherit;color:inherit}',
-      '.cst-collection-icon{display:inline-flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px}',
+      '.cst-collections{color:inherit;font:inherit}',
+      ':is(.cst-collection-group .cst-collection-heading,.cst-group[data-group]) .cst-group-toggle>span{font-size:.875em}',
+      '.cst-collections button,.cst-collection-editor button,.cst-collection-menu-action{cursor:pointer}',
+      '.cst-collection-icon:not([data-size]){display:inline-flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px}',
       '.cst-collection-icon:not([data-size]){border:0;background:transparent;padding:4px;border-radius:6px}',
       '.cst-collection-icon svg{width:16px;height:16px;flex:none}',
-      '.cst-collection-toggle{display:flex;align-items:center;gap:6px;flex:1;min-width:0;text-align:start}',
-      '.cst-collection-toggle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.cst-collection-toggle svg{width:12px;height:12px;flex:none}',
-      '.cst-collection-toggle[aria-expanded="true"] svg{transform:rotate(90deg)}',
-      '.cst-collection-row{position:relative;display:flex;align-items:center;min-height:32px}',
+      '.cst-collection-row{position:relative;display:flex;align-items:center;min-height:30px}',
       '.cst-collection-native{flex:1;min-width:0}',
       '.cst-collection-native>:first-child{width:100%;box-sizing:border-box}',
       '.cst-collections p{margin:4px 9px 8px;color:var(--cst-muted);font-size:12px;line-height:1.5}',
@@ -837,7 +927,7 @@
       ':is(.dark,[data-theme="dark"]) .cst-collection-editor .cst-collection-delete{color:#ff9a91}',
       '.cst-collection-error{font-size:12px;line-height:1.5;color:inherit;overflow-wrap:anywhere}',
       '.cst-collection-error:empty{display:none}',
-      '.cst-collection-icon:not([data-size]):focus-visible,.cst-collection-toggle:focus-visible{outline:2px solid currentColor;outline-offset:2px}',
+      '.cst-collection-icon:not([data-size]):focus-visible{outline:2px solid currentColor;outline-offset:2px}',
       '.cst-collections button:disabled,.cst-collection-editor button:disabled{opacity:.5;cursor:default}',
       '@media(pointer:coarse){.cst-collection-row-actions{opacity:1;pointer-events:auto}.cst-collection-row [data-cst-link]{padding-inline-end:52px}.cst-collection-row{min-height:36px}.cst-collection-editor input[type="text"]{font-size:16px}}',
       '@media(pointer:coarse){[data-cst-shell],[data-cst-sidebar] :is([data-sidebar-cycle-item],.sidebar-item):is([href*="/c/"],:has(a[href*="/c/"])){min-height:36px!important;height:36px!important}}',
@@ -847,14 +937,21 @@
     document.addEventListener('contextmenu', openRowMenu);
     document.addEventListener('pointerdown', rememberMenuTarget, true);
     document.addEventListener('click', rememberMenuTarget, true);
-    document.addEventListener('pointerdown', startCollectionDrag, true);
-    document.addEventListener('pointermove', moveCollectionDrag, true);
-    document.addEventListener('pointerup', finishCollectionDrag, true);
-    document.addEventListener('pointercancel', cancelCollectionDrag, true);
+    // Window capture receives the gesture before any document-level sidebar handlers.
+    window.addEventListener('pointerdown', startCollectionDrag, true);
+    window.addEventListener('pointermove', moveCollectionDrag, true);
+    window.addEventListener('pointerup', finishCollectionDrag, true);
+    window.addEventListener('pointercancel', event => {
+      if (collectionDrag?.pointer === event.pointerId) cancelCollectionDrag();
+    }, true);
+    window.addEventListener('dragstart', event => {
+      if (collectionDrag?.row.contains(event.target)) event.preventDefault();
+    }, true);
+    window.addEventListener('blur', cancelCollectionDrag);
     document.addEventListener('keydown', event => { if (event.key === 'Escape' && collectionDrag) { event.preventDefault(); cancelCollectionDrag(); } }, true);
-    document.addEventListener('click', event => {
+    window.addEventListener('click', event => {
       const suppressed = suppressCollectionClick;
-      if (suppressed && Date.now() <= suppressed.until && (suppressed.link.contains(event.target) || suppressed.common === event.target)) {
+      if (suppressed && Date.now() <= suppressed.until && (suppressed.row.contains(event.target) || suppressed.common === event.target)) {
         event.preventDefault(); event.stopImmediatePropagation(); suppressCollectionClick = null;
       }
     }, true);

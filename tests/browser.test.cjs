@@ -49,14 +49,14 @@ async function nativeList(page, { offset = 0, account = 'workspace-a', archived 
     return { status: response.status, data: data };
   }, { offset, account, archived, suffix });
 }
-async function setup({ items = sample(), nativeRequest = true, listStatus = 200, clock = false, lateInstall = false, context = null } = {}) {
+async function setup({ items = sample(), nativeRequest = true, listStatus = 200, clock = false, lateInstall = false, context = null, html = fixture } = {}) {
   const page = context ? await context.newPage() : await browser.newPage({ viewport: { width: 1280, height: 900 }, timezoneId: 'Asia/Shanghai' });
   if (clock) await page.clock.install({ time: new Date() });
   const state = { items, listStatus, requests: [], details: {} }, errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.route('**/*', route => {
     const request = route.request(), url = new URL(request.url());
-    if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: fixture });
+    if (url.pathname === '/') return route.fulfill({ contentType: 'text/html', body: html });
     state.requests.push({ path: url.pathname, query: url.search, method: request.method(), native: request.headers()['x-native-fixture'] });
     if (url.pathname === '/backend-api/conversations') {
       const offset = Number(url.searchParams.get('offset') || 0);
@@ -371,6 +371,39 @@ test('collection rows reuse native markup, live unread and processing indicators
   } finally { await page.close(); }
 });
 
+test('scrolling through native sidebar updates keeps the collection panel and bookmark mounted', async () => {
+  const { page, state } = await setup();
+  try {
+    const editor = await collectionPicker(page);
+    await editor.getByRole('checkbox', { name: '稍后再看' }).check();
+    await editor.getByRole('button', { name: '保存', exact: true }).click(); await settle(page);
+    await page.evaluate(() => {
+      const sidebar = document.querySelector('aside');
+      sidebar.style.height = '160px';
+      const panel = document.querySelector('.cst-collections');
+      const bookmark = panel.querySelector('.cst-collection-native a');
+      const native = document.querySelector('#native-a .sidebar-item');
+      const menu = native.querySelector('button');
+      let scrolls = 0;
+      sidebar.addEventListener('scroll', () => {
+        menu.classList.toggle('native-scroll-update');
+        scrolls++;
+      });
+      window.scrollProbe = () => ({ scrolls, panel: panel.isConnected, bookmark: bookmark.isConnected });
+    });
+    await page.mouse.move(200, 140);
+    for (const delta of [130, -90, 140, -140]) {
+      await page.mouse.wheel(0, delta);
+      await settle(page);
+    }
+    const result = await page.evaluate(() => window.scrollProbe());
+    assert.ok(result.scrolls >= 2);
+    assert.equal(result.panel, true);
+    assert.equal(result.bookmark, true);
+    assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
 test('unloaded collection links notify the page router without a document navigation and keep back/forward history', async () => {
   const items = sample(); items[0].update_time = new Date(Date.now() - 90000).toISOString();
   const { page, state, errors } = await setup({ items });
@@ -568,6 +601,64 @@ test('dragging native conversations into collapsed groups adds bookmarks; draggi
     assert.equal(page.url(), 'https://chatgpt.com/');
     assertNativeOnly(state, 1); assert.deepEqual(errors, []);
     if (process.env.SCREENSHOT_DIR) await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'collections-drag-result.png') });
+  } finally { await page.close(); }
+});
+
+test('dragging from a native row outside its link reveals collapsed collections and drops into a group', async () => {
+  const { page, state } = await setup();
+  try {
+    await page.locator('#native-b .sidebar-item').evaluate(row => {
+      const rail = document.createElement('span');
+      rail.className = 'fixture-status-rail';
+      rail.style.cssText = 'display:block;width:20px;height:20px;flex:none';
+      row.append(rail);
+    });
+    await page.getByRole('button', { name: '折叠全部收藏', exact: true }).click();
+    await settle(page);
+    const root = page.getByRole('button', { name: '展开全部收藏', exact: true });
+    const target = page.getByRole('button', { name: /^(折叠|展开)稍后再看$/ });
+    const from = await page.locator('.fixture-status-rail').boundingBox();
+    const to = await root.boundingBox();
+    for (const cancel of [true, false]) {
+      await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 12 });
+      await target.waitFor({ state: 'visible', timeout: 2000 });
+      const group = await target.boundingBox();
+      await page.mouse.move(group.x + group.width / 2, group.y + group.height / 2, { steps: 6 });
+      assert.equal(await page.locator('[data-cst-drop-active]').count(), 1);
+      if (cancel) await page.keyboard.press('Escape');
+      await page.mouse.up();
+      await settle(page);
+      if (cancel) {
+        assert.equal(await target.isVisible(), false);
+        assert.equal(await page.locator('#native-b').isVisible(), true);
+      }
+    }
+    assert.equal(await page.locator('.cst-collections a[href="/c/b"]').isVisible(), true);
+    assert.equal(await page.locator('#native-b').isVisible(), false);
+    assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
+test('dragging survives a host document capture listener that stops sidebar pointer events', async () => {
+  const html = fixture.replace('</body>', `<script>
+    for (const type of ['pointerdown', 'pointermove', 'pointerup']) {
+      document.addEventListener(type, event => {
+        if (event.target.closest('#native-list, .cst-collections') &&
+            !event.target.closest('button')) event.stopImmediatePropagation();
+      }, true);
+    }
+  </script></body>`);
+  const { page, state } = await setup({ html });
+  try {
+    const target = page.locator('.cst-collection-group .cst-collection-heading');
+    await dragIntoCollection(page, page.locator('#native-a a'), target);
+    assert.equal(await page.locator('.cst-collections a[href="/c/a"]').isVisible(), true);
+    assert.equal(await page.locator('#native-a').isVisible(), false);
+    assert.equal(await page.locator('.cst-collection-drag,[data-cst-drop-active]').count(), 0);
+    assert.equal(await page.locator('#native-a a').getAttribute('draggable'), null);
+    assertNativeOnly(state, 1);
   } finally { await page.close(); }
 });
 
@@ -826,6 +917,76 @@ test('late installation leaves cached rows alone until ChatGPT itself supplies m
   } finally { await page.close(); }
 });
 
+test('recents uses the native section action and shares its typography and right-hand disclosure', async () => {
+  const nativeButton = '<button class="native-toggle" data-app-action-sidebar-section-toggle aria-expanded="true"><span class="native-label">最近</span><svg class="icon-disclosure native-chevron rotate-0" width="20" height="21"><path d="M4 8l6 6 6-6"/></svg></button>';
+  const html = fixture.replace('</style>', '.native-typography{font:600 15px/20px sans-serif;color:rgb(110,110,110)} .native-header{display:flex;justify-content:space-between;align-items:center;padding-inline:13px;height:36px} .native-toggle{display:flex;align-items:center;gap:4px;color:inherit;padding:0;border:0;background:none} .native-chevron{width:8px;height:9px}</style>')
+    .replace('<div class="group/nav-section-title"><button aria-expanded="true">最近</button></div>', '<div class="group/nav-section-title native-header"><div class="native-typography"><div class="native-toggle-wrapper">' + nativeButton + '</div></div><div class="native-rail"></div></div>')
+    .replace('<section class="group/nav-section"><div class="group/nav-section-title native-header">', '<section class="group/nav-section" data-app-action-sidebar-section-heading="Recents"><div class="group/nav-section"><div class="group/nav-section-title native-header">')
+    .replace('</div></div></section></nav>', '</div></div></div></section></nav>')
+    .replace('<div role="list" id="native-list">', '<div class="group/nav-list" id="native-list">');
+  const { page, state } = await setup({ html });
+  try {
+    const result = await page.evaluate(() => {
+      const native = document.querySelector('[data-app-action-sidebar-section-toggle]');
+      const style = button => {
+        const css = getComputedStyle(button);
+        const rect = button.getBoundingClientRect();
+        const icon = button.querySelector('svg').getBoundingClientRect();
+        return [css.fontFamily, css.fontSize, css.fontWeight, css.lineHeight, css.color, rect.left, icon.width, icon.height];
+      };
+      const buttons = [
+        document.querySelector('.cst-collections > .cst-group button'),
+        document.querySelector('.cst-collection-group .cst-group-toggle'),
+        document.querySelector('#native-list .cst-group-toggle'),
+      ];
+      return { native: style(native), nativeLabelSize: parseFloat(getComputedStyle(native.firstElementChild).fontSize), nativeHeight: native.closest('.native-header').getBoundingClientRect().height, buttons: buttons.map(button => ({
+        style: style(button),
+        labelSize: parseFloat(getComputedStyle(button.firstElementChild).fontSize),
+        wrapper: button.parentElement.className,
+        typography: button.parentElement.parentElement.className,
+        heading: button.closest('.native-header')?.getBoundingClientRect().height,
+        icon: button.lastElementChild.querySelector('path')?.getAttribute('d'),
+        right: button.firstElementChild.getBoundingClientRect().right <= button.lastElementChild.getBoundingClientRect().left,
+      })) };
+    });
+    for (const button of result.buttons) {
+      assert.deepEqual(button.style, result.native);
+      assert.equal(button.wrapper, 'native-toggle-wrapper');
+      assert.equal(button.typography, 'native-typography');
+      assert.equal(button.heading, result.nativeHeight);
+      assert.equal(button.icon, 'M4 8l6 6 6-6');
+      assert.equal(button.right, true);
+    }
+    assert.equal(result.buttons[0].labelSize, result.nativeLabelSize);
+    assert.equal(result.buttons[1].labelSize, result.buttons[2].labelSize);
+    assert.ok(result.buttons[1].labelSize < result.buttons[0].labelSize);
+    const recents = page.locator('[data-app-action-sidebar-section-heading="Recents"]');
+    const dateGroups = recents.locator('[data-cst-owned="group"]:visible');
+    const collections = page.getByRole('region', { name: '收藏分组' });
+    assert.equal(await recents.locator('.cst-collections').count(), 0);
+    for (const label of ['折叠全部收藏', '展开全部收藏']) {
+      await collections.getByRole('button', { name: label, exact: true }).click();
+      await settle(page);
+      assert.equal(await dateGroups.count(), 4);
+    }
+    await recents.evaluate(section => {
+      const toggle = section.querySelector('[data-app-action-sidebar-section-toggle]');
+      toggle.addEventListener('click', () => {
+        const list = section.querySelector('#native-list');
+        list.parentElement.hidden = !list.parentElement.hidden;
+        toggle.setAttribute('aria-expanded', String(!list.parentElement.hidden));
+      });
+    });
+    const nativeToggle = recents.locator('[data-app-action-sidebar-section-toggle]');
+    await nativeToggle.click(); await settle(page);
+    assert.equal(await dateGroups.count(), 0);
+    assert.equal(await collections.getByRole('button', { name: '折叠全部收藏', exact: true }).isVisible(), true);
+    await nativeToggle.click(); await settle(page);
+    assert.equal(await dateGroups.count(), 4);
+    assertNativeOnly(state, 1);
+  } finally { await page.close(); }
+});
+
 test('group collapse preferences survive reload and hidden empty groups without a settings panel', async () => {
   const { page, state } = await setup();
   try {
@@ -1014,7 +1175,7 @@ test('time stays right-aligned after native title replacement in recent and pinn
       });
       assert.equal(aligned, true);
     }
-    assert.equal(await page.locator('#native-a .sidebar-item').evaluate(n => n.getBoundingClientRect().height), 32);
+    assert.equal(await page.locator('#native-a .sidebar-item').evaluate(n => n.getBoundingClientRect().height), 30);
     if (process.env.SCREENSHOT_DIR) {
       fs.mkdirSync(process.env.SCREENSHOT_DIR, { recursive: true });
       await page.locator('aside').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'sidebar-passive-light.png') });

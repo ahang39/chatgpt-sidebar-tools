@@ -33,7 +33,7 @@
 
 已加入任一收藏分组的对话会从“最近”隐藏，并从日期分组计数中扣除，取消最后一个分组后恢复。原生节点仍保留，不归档或删除；置顶区域不受影响。折叠收藏区和刷新网页后仍按此规则显示。收藏行悬停时显示调整分组及移除图标，也可右键调整分组。
 
-拖拽需先展开整个收藏区；普通点击在页面内切换聊天，不整页跳转。网页已渲染该会话时，收藏行镜像原生行结构和样式，保留相对时间、未读蓝点、处理中标记与选中状态，并通过原生链接执行切换；不会移动 React 管理的原始节点。尚未渲染的收藏通过页面的 History 路由切换，只显示已有时间信息，不推测未读状态。浏览器后退、前进以及 Ctrl/Cmd 点击保留原有行为。
+收藏区折叠时，拖到「收藏」标题即可展开并继续拖入子分组。按 Esc 或拖到空白处取消时会恢复折叠状态。普通点击在页面内切换聊天，不整页跳转。网页已渲染该会话时，收藏行镜像原生行结构和样式，保留相对时间、未读蓝点、处理中标记与选中状态，并通过原生链接执行切换；不会移动 React 管理的原始节点。尚未渲染的收藏通过页面的 History 路由切换，只显示已有时间信息，不推测未读状态。浏览器后退、前进以及 Ctrl/Cmd 点击保留原有行为。
 
 收藏区标题和图标按钮复用当前原生侧边栏样式类；菜单项复用原生菜单的样式类及实际字体、字号、行高与内边距。行内编辑期间，网页原生更新不会重建输入框或丢失草稿。
 
@@ -143,7 +143,7 @@ Choose **收藏到分组…** (Add to collection…) in a native conversation me
 
 The **收藏** (Collections) section appears above Recents. Click its heading to collapse the entire section; each child group also remembers its own collapse state. Use the plus icon to create a group and the pencil icon to rename or delete one. Creation, membership changes, and deletion confirmation happen inline, without dialogs. Press Enter to save or Escape to cancel. Icons have tooltips and accessible names. Removing a bookmark or deleting a group does not delete a ChatGPT conversation.
 
-With Collections expanded, drag a conversation from Recents or Pinned onto a group heading. The target highlights and expands after a successful drop. Dragging a bookmark between groups moves only that membership and preserves its other memberships. Drop outside a group or press Escape to cancel. These operations change local collections only; they do not move conversations into ChatGPT cloud projects.
+Drag a conversation from Recents or Pinned onto a group heading. When Collections is collapsed, drag over its heading to reveal the groups. Canceling restores the previous collapse state. The target highlights and expands after a successful drop. Dragging a bookmark between groups moves only that membership and preserves its other memberships. Drop outside a group or press Escape to cancel. These operations change local collections only; they do not move conversations into ChatGPT cloud projects.
 
 Collected conversations are hidden from Recents and excluded from date-group counts. Removing their final collection membership restores them to Recents. The original native nodes remain in place, and pinned chats are unaffected. This display rule survives reloads and collapsing Collections. Hover over a bookmark for membership and removal icons, or right-click it to adjust its groups.
 
